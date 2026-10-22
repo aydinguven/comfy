@@ -3,7 +3,10 @@
 Offline application bundles and a three-node HA bootstrap installer for
 `idmvllmgwp1`, `idmvllmgwp2` and `idmvllmgwp3`.
 
-Run `install.py cluster` on node 1. The wizard offers existing or managed
+Run `sudo python3.12 install.py cluster` on node 1. The interactive wizard detects
+hostname/IP/interface defaults, supports SSH as your login user followed by sudo,
+offers SSH key setup and a secure sudo-password prompt, and lets you edit or
+resume a saved plan. Hostname checks ignore case. The wizard offers existing or managed
 PostgreSQL and Redis, optional HAProxy and Keepalived, and native Python or
 rootless Podman gateways. See [CLUSTER.md](CLUSTER.md) for prerequisites,
 deployment commands, recovery and operational limits.

@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Bootstrap three RHEL gateways from node 1. This is not a rolling-upgrade tool."""
 import argparse
+from copy import deepcopy
+import getpass
 import hashlib
 import ipaddress
 import json
@@ -8,15 +10,112 @@ import os
 from pathlib import Path
 import re
 import secrets
+import shlex
 import shutil
 import socket
 import subprocess
 import sys
+import tarfile
 
 HERE = Path(__file__).resolve().parent
 ROOT = Path('/var/lib/litellm-cluster')
 OWNER = 'litellm-cluster-v1'
 NAMES = ['idmvllmgwp1', 'idmvllmgwp2', 'idmvllmgwp3']
+
+
+def same_host(left, right):
+    return left.rstrip('.').split('.')[0].casefold() == right.rstrip('.').split('.')[0].casefold()
+
+
+def interactive():
+    return sys.stdin.isatty()
+
+
+def ipv4_error(value):
+    try:
+        address = ipaddress.IPv4Address(value)
+        if address.is_unspecified or address.is_multicast or address.is_loopback or address.is_link_local:
+            return 'Use an assigned, routable IPv4 address.'
+    except ValueError:
+        return 'Enter an IPv4 address, for example 192.0.2.10.'
+
+
+def parse_cidrs(value):
+    result = []
+    for item in re.split(r'[,\s]+', value.strip()):
+        if not item:
+            continue
+        network = ipaddress.IPv4Network(item, strict=True)
+        if network.prefixlen and (network.network_address.is_unspecified or network.is_multicast
+                or network.is_loopback or network.is_link_local):
+            raise ValueError('Use your real client network. 0.0.0.0/24 covers only 0.0.0.x; it does not mean all clients.')
+        result.append(str(network))
+    require(result, 'Enter at least one client IP or network.')
+    return list(dict.fromkeys(result))
+
+
+def cidrs_error(value):
+    try:
+        parse_cidrs(value)
+    except ValueError as exc:
+        return str(exc) + ' Use an individual IP (/32), or a network such as 192.0.2.0/24.'
+
+
+def ask_cidrs(prompt, default=None):
+    import install as i
+    while True:
+        result = parse_cidrs(i.ask(prompt, default, cidrs_error))
+        if '0.0.0.0/0' not in result or i.ask_yes('This allows every IPv4 client. Is that intended?', False):
+            return result
+
+
+def local_facts():
+    result = subprocess.run(['ip', '-j', '-4', 'addr', 'show', 'scope', 'global'],
+                            check=True, capture_output=True, text=True)
+    return {'hostname': socket.gethostname(), 'interfaces': json.loads(result.stdout)}
+
+
+def address_interface(facts, address):
+    return next((entry['ifname'] for entry in facts['interfaces']
+        if any(a.get('local') == address for a in entry.get('addr_info', []))), None)
+
+
+def suggested_address(name, facts=None):
+    try:
+        addresses = sorted({x[4][0] for x in socket.getaddrinfo(name, None, socket.AF_INET)})
+        addresses = [a for a in addresses if not ipv4_error(a)]
+        if facts:
+            addresses = [a for a in addresses if address_interface(facts, a)]
+        if len(addresses) == 1:
+            return addresses[0]
+    except OSError:
+        pass
+    if facts:
+        addresses = [a['local'] for entry in facts['interfaces'] for a in entry.get('addr_info', [])
+                     if a.get('local') and not ipv4_error(a['local'])]
+        if len(addresses) == 1:
+            return addresses[0]
+    return None
+
+
+def login_user():
+    return os.environ.get('SUDO_USER') or getpass.getuser()
+
+
+def default_key():
+    paths = [Path.home() / '.ssh' / name for name in ('litellm_cluster', 'id_ed25519', 'id_rsa')]
+    return str(next((p for p in paths if p.is_file()), paths[0]))
+
+
+def vip_error(value, nodes):
+    try:
+        vip = ipaddress.IPv4Interface(value)
+        require(vip.network.prefixlen < 32 and not ipv4_error(str(vip.ip)), 'Use an IPv4 VIP with its subnet prefix.')
+        require(vip.ip not in (vip.network.network_address, vip.network.broadcast_address), 'VIP cannot be the network or broadcast address.')
+        require(str(vip.ip) not in {n['address'] for n in nodes}, 'Reserve a separate unused VIP; do not use a node address.')
+        require(all(ipaddress.IPv4Address(n['address']) in vip.network for n in nodes), 'VIP and all nodes must share a subnet.')
+    except ValueError as exc:
+        return str(exc)
 
 
 def require(ok, message):
@@ -56,9 +155,10 @@ def validate(p):
     require(len(nodes) == 3, 'Exactly three nodes are required')
     for n in nodes:
         require(host(n['name']), 'Invalid node name')
-        require(ipaddress.ip_address(n['address']).version == 4, 'Use IPv4 node addresses')
+        require(not ipv4_error(n['address']), 'Use assigned IPv4 node addresses')
         require(re.fullmatch(r'[A-Za-z0-9_.:-]{1,32}', n['interface']), 'Invalid interface')
-    require(len({n['name'] for n in nodes}) == 3 and len({n['address'] for n in nodes}) == 3, 'Duplicate nodes')
+    require(len({n['name'].rstrip('.').split('.')[0].casefold() for n in nodes}) == 3
+        and len({n['address'] for n in nodes}) == 3, 'Duplicate nodes (hostname case is ignored)')
     for kind in ('postgresql', 'redis'):
         require(services[kind] in ('managed', 'external'), 'Invalid ' + kind + ' choice')
     require(type(services['haproxy']) is bool, 'HAProxy must be a boolean')
@@ -84,66 +184,122 @@ def validate(p):
             'Incorrect managed Sentinel endpoints')
     require(p['client_cidrs'] and a['lb_cidrs'], 'Client and load-balancer CIDRs required')
     for cidr in p['client_cidrs'] + a['lb_cidrs'] + a['admin_cidrs']:
-        require(ipaddress.ip_network(cidr, strict=True).version == 4, 'This implementation uses IPv4 CIDRs')
+        parse_cidrs(cidr)
     require(re.fullmatch(r'[A-Za-z_][A-Za-z0-9_-]*', p['ssh_user']), 'Invalid SSH user')
+    require(p.get('sudo_mode', 'passwordless') in ('password', 'passwordless'), 'Invalid sudo mode')
     vip = services.get('vip')
     if vip:
         require(services['haproxy'], 'VIP needs managed HAProxy')
-        vi = ipaddress.ip_interface(vip['address'])
-        require(vi.version == 4 and vi.network.prefixlen < 32, 'VIP needs IPv4 prefix')
-        require(str(vi.ip) not in {n['address'] for n in nodes}, 'VIP conflicts with node IP')
-        require(all(ipaddress.ip_address(n['address']) in vi.network for n in nodes), 'VIP requires shared subnet')
+        problem = vip_error(vip['address'], nodes)
+        require(not problem, problem)
         require(1 <= vip['router_id'] <= 255, 'Invalid VRRP router ID')
     return p
 
 
-def wizard():
+def wizard(previous=None):
     import install as i
+    previous = previous or {}
+    old_nodes = previous.get('nodes', [])
+    old_services, old_a = previous.get('services', {}), previous.get('answers', {})
+    old_gateway, old_tls = previous.get('gateway', {}), previous.get('tls', {})
     p = {'schema': 1, 'nodes': [], 'services': {}, 'tls': {}}
-    print('Run on node 1. Nodes 2/3 need verified SSH keys and root/passwordless sudo.')
-    for default in NAMES:
-        name = i.ask('Node hostname', default, i.v_host)
-        p['nodes'].append({'name': name, 'address': i.ask('IPv4 address for ' + name),
-                           'interface': i.ask('Interface on ' + name, 'ens192')})
-    p['ssh_user'] = i.ask('SSH user on nodes 2/3', 'root')
-    p['identity_file'] = i.ask('SSH private key path (optional)', optional=True)
+    print('Three-node bootstrap: SSH as your login user, then sudo. Password-based sudo is supported.')
+    print('Press Enter to accept a detected/default value. Hostname comparisons ignore case.')
+    try:
+        facts = local_facts()
+    except (OSError, ValueError, subprocess.SubprocessError):
+        facts = {'hostname': socket.gethostname(), 'interfaces': []}
+    for index, default in enumerate(NAMES):
+        old = old_nodes[index] if index < len(old_nodes) else {}
+        default = old.get('name', facts['hostname'].split('.')[0] if index == 0 else default)
+        def name_error(value):
+            problem = i.v_host(value)
+            if problem:
+                return problem
+            if index == 0 and not same_host(value, facts['hostname']):
+                return 'This controller is ' + facts['hostname'] + '; enter its hostname (case does not matter).'
+            if any(same_host(value, n['name']) for n in p['nodes']):
+                return 'Each node needs a different hostname.'
+        name = i.ask('Node ' + str(index + 1) + ' hostname', default, name_error)
+        def address_error(value):
+            return ipv4_error(value) or ('Each node needs a different address.' if any(n['address'] == value for n in p['nodes']) else None)
+        address = i.ask('IPv4 address for ' + name, old.get('address') or suggested_address(name, facts if index == 0 else None), address_error)
+        detected = address_interface(facts, address) if index == 0 else None
+        interface = i.ask('Interface on ' + name + ' (auto = detect from its IP)',
+            old.get('interface', detected or 'auto'), lambda v: None if re.fullmatch(r'[A-Za-z0-9_.:-]{1,32}', v) else 'Invalid interface name.')
+        p['nodes'].append({'name': name, 'address': address, 'interface': interface})
+    p['ssh_user'] = i.ask('SSH login user on nodes 2/3', previous.get('ssh_user', login_user()),
+        lambda v: None if re.fullmatch(r'[A-Za-z_][A-Za-z0-9_-]*', v) else 'Invalid login user.')
+    p['identity_file'] = i.ask('SSH private key path (missing key can be created; type agent to use SSH agent)',
+        previous.get('identity_file', default_key()), optional=True)
+    if p['identity_file'].casefold() == 'agent':
+        p['identity_file'] = ''
+    if p['identity_file']:
+        p['identity_file'] = str(Path(p['identity_file']).expanduser().absolute())
+    p['sudo_mode'] = 'passwordless' if p['ssh_user'] == 'root' else i.ask_choice('How does this user use sudo on nodes 2/3?',
+        [('password', 'Prompt securely for the shared sudo password'), ('passwordless', 'Passwordless sudo')], previous.get('sudo_mode', 'password'))
+    if p['sudo_mode'] == 'password':
+        print('Ansible will prompt once. Both remote nodes must accept that sudo password. It is not saved in the plan.')
     for kind, description in [('postgresql', 'PostgreSQL 16 + Patroni + etcd quorum'), ('redis', 'Redis 7 + Sentinel quorum')]:
         p['services'][kind] = i.ask_choice(kind, [('external', 'Use existing HA service'),
-            ('managed', 'Installer-managed ' + description)], 'external' if kind == 'postgresql' else 'managed')
-    p['services']['haproxy'] = i.ask_yes('Manage HAProxy HTTPS frontend on all nodes?', True)
+            ('managed', 'Installer-managed ' + description)], old_services.get(kind, 'external' if kind == 'postgresql' else 'managed'))
+    p['services']['haproxy'] = i.ask_yes('Manage HAProxy HTTPS frontend on all nodes?', old_services.get('haproxy', True))
     p['services']['vip'] = None
-    if p['services']['haproxy'] and i.ask_yes('Manage a floating VIP with Keepalived?', True):
-        p['services']['vip'] = {'address': i.ask('Unused VIP address/prefix'),
-            'router_id': int(i.ask('Unused VRRP router ID', '51', i.v_int(1, 255)))}
-    p['gateway'] = {'mode': i.ask_choice('LiteLLM runtime', [('container', 'Rootless Podman'), ('native', 'Python 3.12 + systemd')], 'container'),
-        'version': i.ask('Exact LiteLLM release', 'v1.106.2'), 'workers': int(i.ask('Workers per node', '1', i.v_int(1, 64)))}
-    p['client_cidrs'] = i.split_list(i.ask('Client CIDRs allowed to reach HAProxy', check=i.v_cidrs))
-    a = {'fqdn': i.ask('Gateway DNS name', check=i.v_host), 'host_port': 4000, 'workers': p['gateway']['workers'],
+    if p['services']['haproxy'] and i.ask_yes('Manage a floating VIP with Keepalived?', bool(old_services.get('vip')) if previous else True):
+        old_vip = old_services.get('vip') or {}
+        print('Use a reserved, unused IPv4 address/prefix on the subnet shared by all three nodes.')
+        p['services']['vip'] = {'address': i.ask('Unused VIP address/prefix', old_vip.get('address'), lambda v: vip_error(v, p['nodes'])),
+            'router_id': int(i.ask('Unused VRRP router ID', str(old_vip.get('router_id', 51)), i.v_int(1, 255)))}
+    if not p['services']['vip']:
+        p['frontend'] = i.ask_choice('How will clients reach the cluster?',
+            [('external', 'Existing external load balancer'), ('single-node', 'One node for initial testing; client address is not HA')], previous.get('frontend', 'external'))
+        if p['frontend'] == 'single-node':
+            print('Point the gateway DNS at node 1 for testing. Losing node 1 interrupts this client address.')
+        else:
+            print('Point the gateway DNS at your external load balancer, configured for all three nodes.')
+    p['gateway'] = {'mode': i.ask_choice('LiteLLM runtime', [('container', 'Rootless Podman'), ('native', 'Python 3.12 + systemd')], old_gateway.get('mode', 'container')),
+        'version': i.ask('Exact LiteLLM release', old_gateway.get('version', 'v1.106.2'),
+            lambda v: None if re.fullmatch(r'v\d+\.\d+\.\d+', v) and v != 'v1.107.0' else 'Enter an exact supported tag, such as v1.106.2.'),
+        'workers': int(i.ask('Workers per node', str(old_gateway.get('workers', 1)), i.v_int(1, 64)))}
+    client_default = ','.join(previous.get('client_cidrs', [])) or None
+    ssh_client = (os.environ.get('SSH_CONNECTION') or os.environ.get('SSH_CLIENT') or '').split()
+    if not client_default and ssh_client and not ipv4_error(ssh_client[0]):
+        client_default = ssh_client[0] + '/32'
+    print('Client access: enter real client IPs (/32) or network CIDRs, separated by commas. 0.0.0.0/24 does NOT mean all clients.')
+    p['client_cidrs'] = ask_cidrs('Client IPs/CIDRs allowed to reach ' + ('HAProxy' if p['services']['haproxy'] else 'your external load balancer'), client_default)
+    a = {'fqdn': i.ask('Gateway DNS name', old_a.get('fqdn'), i.v_host), 'host_port': 4000, 'workers': p['gateway']['workers'],
         'node_count': 3, 'node_tls': True, 'lb_cidrs': [n['address'] + '/32' for n in p['nodes']], 'admin_cidrs': [],
-        'retention': i.ask('Log retention', '90d', i.v_retention), 'pg_db': 'litellm', 'pg_user': 'litellm',
+        'retention': i.ask('Log retention', old_a.get('retention', '90d'), i.v_retention), 'pg_db': 'litellm', 'pg_user': 'litellm',
         'pg_bouncer_tx': False, 'redis_username': '', 'redis_auth': True, 'redis_tls': True, 'model_urls': []}
     if not p['services']['haproxy']:
-        a['lb_cidrs'] = i.split_list(i.ask('External load-balancer source CIDRs', check=i.v_cidrs))
+        a['lb_cidrs'] = ask_cidrs('External load-balancer source CIDRs', ','.join(old_a.get('lb_cidrs', [])) or None)
     if p['services']['postgresql'] == 'managed':
         a.update(pg_host='localhost', pg_port=6432, pg_sslmode='verify-full')
     else:
-        a.update(pg_host=i.ask('Existing writable PostgreSQL endpoint', check=i.v_host), pg_port=int(i.ask('PostgreSQL port', '5432', i.v_int(1, 65535))),
-            pg_db=i.ask('Database', 'litellm', i.v_ident), pg_user=i.ask('Database owner', 'litellm', i.v_ident), pg_sslmode='verify-full')
-        a['pg_bouncer_tx'] = i.ask_yes('PgBouncer transaction pooling?', False)
+        a.update(pg_host=i.ask('Existing writable PostgreSQL endpoint', old_a.get('pg_host') if old_services.get('postgresql') == 'external' else None, i.v_host),
+            pg_port=int(i.ask('PostgreSQL port', str(old_a.get('pg_port', 5432)) if old_services.get('postgresql') == 'external' else '5432', i.v_int(1, 65535))),
+            pg_db=i.ask('Database', old_a.get('pg_db', 'litellm'), i.v_ident), pg_user=i.ask('Database owner', old_a.get('pg_user', 'litellm'), i.v_ident), pg_sslmode='verify-full')
+        a['pg_bouncer_tx'] = i.ask_yes('PgBouncer transaction pooling?', old_a.get('pg_bouncer_tx', False))
     if p['services']['redis'] == 'managed':
         a.update(redis_topology='sentinel', redis_nodes=[[n['address'], 26379] for n in p['nodes']], redis_service_name='litellm', redis_sentinel_auth=True)
     else:
-        a['redis_topology'] = i.ask_choice('Existing Redis topology', [('standalone', 'Single endpoint'), ('sentinel', 'Sentinel'), ('cluster', 'Redis Cluster')], 'sentinel')
-        a['redis_nodes'] = i.parse_hostports(i.ask('Redis or Sentinel hosts:ports', check=i.v_hostports))
-        a['redis_service_name'] = i.ask('Sentinel master name', 'litellm', i.v_ident) if a['redis_topology'] == 'sentinel' else ''
-        a['redis_sentinel_auth'] = a['redis_topology'] == 'sentinel' and i.ask_yes('Sentinel password required?', True)
-        a['redis_username'] = i.ask('Redis ACL username (empty = default)', optional=True, check=i.v_ident)
-    p['tls']['external_ca'] = i.ask('PEM trust bundle for external services', check=i.v_pem_cert,
-        optional=p['services']['postgresql'] == p['services']['redis'] == 'managed')
+        a['redis_topology'] = i.ask_choice('Existing Redis topology', [('standalone', 'Single endpoint'), ('sentinel', 'Sentinel'), ('cluster', 'Redis Cluster')],
+            old_a.get('redis_topology', 'sentinel'))
+        old_endpoints = ','.join(str(h) + ':' + str(port) for h, port in old_a.get('redis_nodes', [])) if old_services.get('redis') == 'external' else None
+        a['redis_nodes'] = i.parse_hostports(i.ask('Redis or Sentinel hosts:ports', old_endpoints, i.v_hostports))
+        a['redis_service_name'] = i.ask('Sentinel master name', old_a.get('redis_service_name') or 'litellm', i.v_ident) if a['redis_topology'] == 'sentinel' else ''
+        a['redis_sentinel_auth'] = a['redis_topology'] == 'sentinel' and i.ask_yes('Sentinel password required?', old_a.get('redis_sentinel_auth', True))
+        a['redis_username'] = i.ask('Redis ACL username (empty = default)', old_a.get('redis_username', ''), optional=True, check=i.v_ident)
+    p['tls']['external_ca'] = ''
+    if 'external' in (p['services']['postgresql'], p['services']['redis']):
+        p['tls']['external_ca'] = i.ask('PEM trust bundle for existing PostgreSQL/Redis', old_tls.get('external_ca'), i.v_pem_cert)
     p['tls'].update(frontend_cert='', frontend_key='')
-    if p['services']['haproxy'] and i.ask_yes('Use an existing client-facing TLS certificate?', True):
-        p['tls']['frontend_cert'] = i.ask('Frontend full-chain PEM certificate', check=i.v_pem_cert)
-        p['tls']['frontend_key'] = i.ask('Frontend private key PEM', check=i.v_pem_key)
+    if p['services']['haproxy']:
+        supplied = i.ask_choice('Client-facing TLS certificate', [('generated', 'Generate internal certificate; clients must trust the cluster CA'),
+            ('existing', 'Use an existing certificate and private key')], 'existing' if old_tls.get('frontend_cert') else 'generated')
+        if supplied == 'existing':
+            p['tls']['frontend_cert'] = i.ask('Frontend full-chain PEM certificate', old_tls.get('frontend_cert'), i.v_pem_cert)
+            p['tls']['frontend_key'] = i.ask('Frontend private key PEM', old_tls.get('frontend_key'), i.v_pem_key)
     p['answers'] = a
     return validate(p)
 
@@ -365,6 +521,164 @@ def inventory(p):
     return {'all': {'children': {'gateways': {'hosts': hosts}}}}
 
 
+def ensure_tools():
+    import install as i
+    required = {'ansible-playbook': 'ansible-core', 'openssl': 'openssl', 'ssh': 'openssh-clients', 'ssh-copy-id': 'openssh-clients'}
+    packages = sorted({package for command, package in required.items() if not shutil.which(command)})
+    if packages:
+        require(interactive() and shutil.which('dnf'), 'Install controller prerequisites: ' + ' '.join(packages))
+        require(i.ask_yes('Install missing controller packages from your RHEL repositories: ' + ', '.join(packages) + '?', True), 'Controller prerequisites are required')
+        subprocess.run(['dnf', '-y', 'install'] + packages, check=True)
+    require(all(shutil.which(command) for command in required), 'Controller prerequisites are still missing')
+
+
+def ssh_command(p, node, batch=True):
+    argv = ['ssh', '-o', 'StrictHostKeyChecking=' + ('yes' if batch else 'ask'),
+        '-o', 'ConnectTimeout=10', '-o', 'BatchMode=' + ('yes' if batch else 'no')]
+    if p.get('identity_file'):
+        argv += ['-i', p['identity_file']]
+    return argv + [p['ssh_user'] + '@' + node['address']]
+
+
+def prepare_ssh(p):
+    import install as i
+    key = Path(p['identity_file']) if p.get('identity_file') else None
+    if key and not key.is_file():
+        require(interactive(), 'SSH key is missing: ' + str(key))
+        require(i.ask_yes('Create a dedicated RSA 3072 SSH key at ' + str(key) + ' for unattended deployment?', True), 'Supply an existing SSH key or agent')
+        key.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        subprocess.run(['ssh-keygen', '-t', 'rsa', '-b', '3072', '-f', str(key), '-N', ''], check=True)
+        key.chmod(0o600)
+    for node in p['nodes'][1:]:
+        result = subprocess.run(ssh_command(p, node) + ['true'], capture_output=True, text=True)
+        if result.returncode:
+            print('SSH key access to ' + node['name'] + ' is not ready: ' + result.stderr.strip())
+            require(interactive() and key, 'Prepare verified SSH key/agent access as ' + p['ssh_user'] + ' to ' + node['address'])
+            public_key = Path(str(key) + '.pub')
+            require(public_key.is_file(), 'Public key missing: ' + str(public_key) + '; supply its public key before copying it')
+            require(i.ask_yes('Install this public key for ' + p['ssh_user'] + '@' + node['address'] + '? Verify the displayed host fingerprint against its console.', True), 'SSH setup cancelled')
+            # The user answers OpenSSH host-key and password prompts directly.
+            subprocess.run(['ssh-copy-id', '-o', 'StrictHostKeyChecking=ask', '-i', str(public_key),
+                            p['ssh_user'] + '@' + node['address']], check=True)
+            subprocess.run(ssh_command(p, node) + ['true'], check=True)
+
+
+def inspect_nodes(p, locked=False):
+    """Read addressing before provisioning; resolve 'auto' only for an unapplied plan."""
+    import install as i
+    script = ("import json,socket,subprocess; print(json.dumps({'hostname':socket.gethostname(),"
+        "'interfaces':json.loads(subprocess.check_output(['ip','-j','-4','addr','show','scope','global'],text=True))}))")
+    for index, node in enumerate(p['nodes']):
+        if index == 0:
+            facts = local_facts()
+        else:
+            result = subprocess.run(ssh_command(p, node) + ['python3 -c ' + shlex.quote(script)],
+                                    check=True, capture_output=True, text=True)
+            facts = json.loads(result.stdout)
+        require(same_host(facts['hostname'], node['name']), node['address'] + ' reports hostname ' + facts['hostname'] + ', expected ' + node['name'])
+        detected = address_interface(facts, node['address'])
+        require(detected, node['address'] + ' is not assigned to ' + node['name'])
+        if node['interface'] == 'auto':
+            require(not locked, 'A deployed plan cannot contain an unresolved interface')
+            node['interface'] = detected
+        elif node['interface'] != detected:
+            require(not locked and interactive(), node['name'] + ' uses interface ' + detected + ', not ' + node['interface'])
+            require(i.ask_yes(node['name'] + ': address is on ' + detected + '. Correct interface ' + node['interface'] + '?', True), 'Correct the interface before deployment')
+            node['interface'] = detected
+        print('Verified ' + node['name'] + ' (' + facts['hostname'] + '): ' + node['address'] + ' on ' + detected)
+    return validate(p)
+
+
+def choose_bundle(explicit=None):
+    import install as i
+    if explicit:
+        path = explicit.expanduser().resolve()
+    else:
+        candidates = sorted({p.resolve() for folder in (HERE, HERE.parent)
+            for p in folder.glob('*.tar') if p.with_name(p.name + '.sha256').is_file()},
+            key=lambda p: p.stat().st_mtime, reverse=True)
+        remembered = ROOT / 'bundle.json'
+        if remembered.is_file():
+            old = Path(json.loads(remembered.read_text())['path'])
+            if old.is_file():
+                candidates = [old] + [p for p in candidates if p != old]
+        require(interactive(), 'Supply --bundle /absolute/path/cluster.tar')
+        path = Path(i.ask('Cluster bundle tar path', str(candidates[0]) if candidates else None,
+            lambda value: None if Path(value).expanduser().is_file() else 'File not found.')).expanduser().resolve()
+    require(path.is_file(), 'Bundle file not found: ' + str(path))
+    sidecar = path.with_name(path.name + '.sha256')
+    require(sidecar.is_file(), 'Keep the matching SHA-256 sidecar next to ' + path.name)
+    expected = sidecar.read_text().split()
+    require(expected and re.fullmatch(r'[0-9a-fA-F]{64}', expected[0]), 'Invalid SHA-256 sidecar')
+    print('Verifying bundle SHA-256: ' + path.name)
+    require(sha(path) == expected[0].lower(), 'Bundle checksum mismatch; replace it with a verified download')
+    return path
+
+
+def verify_bundle_plan(p, bundle):
+    with tarfile.open(bundle, 'r:*') as archive:
+        manifests = [m for m in archive.getmembers() if m.isfile() and m.name.count('/') == 1 and m.name.endswith('/BUNDLE.json')]
+        require(len(manifests) == 1 and manifests[0].size < 1024 * 1024, 'Expected one valid bundle manifest')
+        meta = json.load(archive.extractfile(manifests[0]))
+    parts = {part['part'] for part in meta['parts'] if part.get('litellm_version') == p['gateway']['version']
+             and part.get('platform') == 'linux/amd64'}
+    needed = {'image'} if p['gateway']['mode'] == 'container' else {'litellm', 'python', 'prisma'}
+    require(needed <= parts, 'This bundle does not contain ' + p['gateway']['version'] + ' for ' + p['gateway']['mode'] + '. Select a bundled release/runtime.')
+
+
+def locked_state():
+    return any((ROOT / name).exists() for name in ('ownership.json', 'secrets.json', 'work'))
+
+
+def select_plan(config=None):
+    import install as i
+    if config:
+        return validate(json.loads(config.read_text()))
+    saved = ROOT / 'cluster.json'
+    if saved.is_file():
+        previous = json.loads(saved.read_text())
+        try:
+            validate(previous)
+        except ValueError as exc:
+            if locked_state() or not interactive():
+                raise
+            print('The saved draft needs correction: ' + str(exc))
+            if i.ask_yes('Edit this draft now?', True):
+                return wizard(previous)
+            return None
+        if not interactive():
+            return previous
+        options = [('resume', 'Resume the saved cluster plan')]
+        if not locked_state():
+            options.append(('edit', 'Edit the saved draft; provisioning has not started'))
+        options.append(('cancel', 'Exit'))
+        choice = i.ask_choice('A saved plan was found at ' + str(saved), options, 'resume')
+        if choice == 'cancel':
+            return None
+        return wizard(previous) if choice == 'edit' else previous
+    return wizard()
+
+
+def summary(p):
+    print(json.dumps({'nodes': p['nodes'], 'ssh_user': p['ssh_user'], 'sudo': p.get('sudo_mode', 'legacy; selected at apply'),
+        'gateway': p['gateway'], 'services': p['services'], 'client_cidrs': p['client_cidrs'],
+        'gateway_dns': p['answers']['fqdn'], 'frontend': 'VIP' if p['services'].get('vip') else p.get('frontend', 'external load balancer required'),
+        'SELinux': 'haproxy_connect_any enabled when a local proxy is selected',
+        'scope': 'fresh bootstrap; foreign data/services refused'}, indent=2))
+
+
+def playbook_command(p, work):
+    argv = ['ansible-playbook', '-i', str(work / 'inventory.json'), str(work / 'playbook.json')]
+    sudo_mode = p.get('sudo_mode')
+    if sudo_mode is None and p['ssh_user'] != 'root' and interactive():
+        import install as i
+        sudo_mode = i.ask_choice('Sudo on nodes 2/3', [('password', 'Prompt for shared sudo password'),
+            ('passwordless', 'Passwordless sudo')], 'password')
+    if sudo_mode == 'password' and p['ssh_user'] != 'root':
+        argv.append('--ask-become-pass')
+    return argv
+
+
 def playbook(p, work, bundle, infrastructure):
     pg, redis = p['services']['postgresql'] == 'managed', p['services']['redis'] == 'managed'
     proxy, vip = pg or p['services']['haproxy'], p['services'].get('vip')
@@ -433,39 +747,68 @@ def playbook(p, work, bundle, infrastructure):
 
 
 def main(argv=None):
+    argv = sys.argv[1:] if argv is None else list(argv)
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--config', type=Path, help='Saved public plan; otherwise start wizard')
-    parser.add_argument('--bundle', type=Path, help='Verified application/cluster tar')
+    parser.add_argument('--config', type=Path, help='Saved public plan; otherwise resume or start wizard')
+    parser.add_argument('--bundle', type=Path, help='Cluster tar; otherwise find it interactively')
     parser.add_argument('--infrastructure', type=Path, help='Offline PostgreSQL HA payload')
-    parser.add_argument('--plan-only', action='store_true', help='Save/validate plan; remote nodes unchanged')
+    parser.add_argument('--plan-only', action='store_true', help='Save/validate draft; remote nodes unchanged')
     parser.add_argument('--yes', action='store_true', help='Skip only the final apply prompt')
     args = parser.parse_args(argv)
     try:
-        require(os.geteuid() == 0, 'Run as root on node 1')
+        import install as i
+        if os.geteuid() != 0:
+            require(interactive() and shutil.which('sudo'), 'Run with sudo on node 1')
+            if not i.ask_yes('Restart this installer with sudo on node 1?', True):
+                return 0
+            os.execvp('sudo', ['sudo', sys.executable, str(HERE / 'cluster.py')] + argv)
         os.umask(0o077)
-        p = validate(json.loads(args.config.read_text())) if args.config else wizard()
-        require(socket.gethostname().split('.')[0] == p['nodes'][0]['name'].split('.')[0], 'Run on ' + p['nodes'][0]['name'])
         ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
         require(not ROOT.is_symlink() and ROOT.stat().st_uid == 0, 'Controller state must be root-owned')
         ROOT.chmod(0o700)
+        p = select_plan(args.config)
+        if p is None:
+            return 0
+        require(same_host(socket.gethostname(), p['nodes'][0]['name']), 'Run on ' + p['nodes'][0]['name'])
         saved = ROOT / 'cluster.json'
-        if saved.exists():
-            require(plan_id(json.loads(saved.read_text())) == plan_id(p), 'Topology differs; use an explicit migration')
-        save(saved, p)
-        print(json.dumps({'nodes': p['nodes'], 'gateway': p['gateway'], 'services': p['services'], 'client_cidrs': p['client_cidrs'],
-            'SELinux': 'haproxy_connect_any enabled when a local proxy is selected', 'scope': 'fresh bootstrap; foreign data/services refused'}, indent=2))
+        locked = locked_state()
+        if locked:
+            require(saved.is_file() and plan_id(json.loads(saved.read_text())) == plan_id(p),
+                'Provisioning already started. Resume the SAME saved plan; topology changes require an explicit migration')
+        else:
+            save(saved, p)
         if args.plan_only:
-            print('Plan saved to ' + str(saved) + '; remote nodes unchanged.')
+            summary(p)
+            print('Draft saved to ' + str(saved) + '; auto interfaces will be detected at apply. Remote nodes unchanged.')
             return 0
-        require(args.bundle and args.bundle.is_file(), 'Supply --bundle /absolute/path/application.tar')
-        require(shutil.which('ansible-playbook') and shutil.which('openssl'), 'Install ansible-core and openssl on node 1')
+        ensure_tools()
+        bundle = choose_bundle(args.bundle)
         infra = args.infrastructure.resolve() if args.infrastructure else HERE / 'infrastructure'
-        if p['services']['postgresql'] == 'managed':
-            from cluster_node import verify_infrastructure
-            verify_infrastructure(infra)
-        import install as i
-        if not args.yes and not i.ask_yes('Apply this plan to ALL THREE nodes?', False):
-            return 0
+        while True:
+            verify_bundle_plan(p, bundle)
+            if p['services']['postgresql'] == 'managed':
+                from cluster_node import verify_infrastructure
+                verify_infrastructure(infra)
+            prepare_ssh(p)
+            inspect_nodes(p, locked=locked)
+            if not locked:
+                save(saved, p)
+            summary(p)
+            if args.yes:
+                break
+            choices = [('apply', 'Apply this plan to ALL THREE nodes')]
+            if not locked:
+                choices.append(('edit', 'Edit answers before provisioning'))
+            choices.append(('exit', 'Save and exit'))
+            choice = i.ask_choice('Review the plan', choices, 'exit')
+            if choice == 'exit':
+                print('Plan saved. Run this command again to resume.')
+                return 0
+            if choice == 'apply':
+                break
+            p = wizard(deepcopy(p))
+            save(saved, p)
+        save(ROOT / 'bundle.json', {'path': str(bundle)})
         secret_path = ROOT / 'secrets.json'
         if secret_path.exists():
             require(not secret_path.is_symlink() and secret_path.stat().st_uid == 0 and secret_path.stat().st_mode & 0o077 == 0, 'Unsafe secrets permissions')
@@ -476,16 +819,23 @@ def main(argv=None):
             print('Back up ' + str(secret_path) + ' and the controller CA to your vault.')
         work = ROOT / 'work'
         work.mkdir(mode=0o700, exist_ok=True)
-        stage(p, s, work, args.bundle.resolve())
+        stage(p, s, work, bundle)
         save(work / 'inventory.json', inventory(p))
-        save(work / 'playbook.json', playbook(p, work, args.bundle.resolve(), infra))
+        save(work / 'playbook.json', playbook(p, work, bundle, infra))
         env = dict(os.environ, ANSIBLE_HOST_KEY_CHECKING='True', ANSIBLE_DISPLAY_ARGS_TO_STDOUT='False', ANSIBLE_LOCAL_TEMP=str(ROOT / 'ansible-tmp'))
-        r = subprocess.run(['ansible-playbook', '-i', str(work / 'inventory.json'), str(work / 'playbook.json')], env=env)
-        require(r.returncode == 0, 'Deployment failed. Fix the failed phase and rerun the SAME plan and secrets.')
+        if p.get('sudo_mode') == 'passwordless':
+            env['ANSIBLE_BECOME_ASK_PASS'] = 'False'
+        r = subprocess.run(playbook_command(p, work), env=env)
+        require(r.returncode == 0, 'Deployment failed. Fix the failed phase and rerun; choose Resume saved plan. Keep the SAME bundle and secrets.')
         print('All selected services passed health checks. Gateway: https://' + p['answers']['fqdn'] + '/ui')
         return 0
-    except (ValueError, RuntimeError, KeyError, OSError, subprocess.CalledProcessError) as exc:
+    except KeyboardInterrupt:
+        print('\nCoordinator cancelled. Remote actions already started may finish. Rerun to resume the saved plan.', file=sys.stderr)
+        return 130
+    except (ValueError, RuntimeError, KeyError, OSError, tarfile.TarError, subprocess.CalledProcessError) as exc:
         print('Cluster installer: ' + str(exc), file=sys.stderr)
+        if isinstance(exc, subprocess.CalledProcessError) and exc.stderr:
+            print(str(exc.stderr)[-2000:], file=sys.stderr)
         return 1
 
 

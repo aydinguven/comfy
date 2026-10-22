@@ -16,6 +16,8 @@ import tempfile
 import urllib.request
 import zipfile
 
+from install import INSTALLER_VERSION
+
 HERE = Path(__file__).resolve().parent
 ETCD_VERSION = 'v3.6.7'
 ETCD_SHA256 = 'cf8af880c5a01ee5363cefa14a3e0cb7e5308dcf4ed17a6973099c9a7aee5a9a'
@@ -77,7 +79,7 @@ def combine(source, destination, infrastructure):
     replacements = {name: (HERE / name).read_bytes() for name in FILES}
     replacements['install.py'] = installer_bytes()
     replacements['PART.json'] = (json.dumps({'format': 1, 'part': 'installer', 'name': 'part-installer',
-        'installer_version': '2026-10-22.5', 'files': list(FILES)}, indent=2) + '\n').encode()
+        'installer_version': INSTALLER_VERSION, 'files': list(FILES)}, indent=2) + '\n').encode()
     replacements['SHA256SUMS'] = ''.join(hashlib.sha256(data).hexdigest() + '  ' + name + '\n'
         for name, data in sorted(replacements.items())).encode()
     partial = destination.with_name(destination.name + '.partial')
@@ -99,7 +101,7 @@ def combine(source, destination, infrastructure):
                     continue
                 if rel == 'BUNDLE.json':
                     meta = json.load(old.extractfile(m))
-                    meta.update(cluster_installer='2026-10-22.5', managed_postgresql_payload=infrastructure is not None)
+                    meta.update(cluster_installer=INSTALLER_VERSION, managed_postgresql_payload=infrastructure is not None)
                     body = (json.dumps(meta, indent=2) + '\n').encode()
                     entry = tarfile.TarInfo(m.name)
                     entry.size, entry.mode = len(body), 0o644

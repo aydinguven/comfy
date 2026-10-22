@@ -29,6 +29,20 @@ def plan():
 
 
 class Validation(unittest.TestCase):
+    def test_case_insensitive_host_identity_and_duplicates(self):
+        self.assertTrue(cluster.same_host('IDMVLLMGWP1.example.test', 'idmvllmgwp1'))
+        self.assertFalse(cluster.same_host('idmvllmgwp2', 'idmvllmgwp1'))
+        p = plan()
+        p['nodes'][1]['name'] = p['nodes'][0]['name'].upper()
+        with self.assertRaises(ValueError):
+            cluster.validate(p)
+
+    def test_client_network_typo_rejected_but_individual_ip_supported(self):
+        self.assertEqual(cluster.parse_cidrs('198.51.100.42, 192.0.2.0/24'), ['198.51.100.42/32', '192.0.2.0/24'])
+        for value in ('0.0.0.0/24', '198.51.100.42/24', '127.0.0.1', '224.0.0.0/24', 'bad'):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                cluster.parse_cidrs(value)
+
     def test_both_postgresql_paths(self):
         p = plan()
         cluster.validate(p)
@@ -120,6 +134,166 @@ class Rendering(unittest.TestCase):
             self.assertEqual(text.count('    192.0.2.'), 3)
 
 
+class InteractiveBootstrap(unittest.TestCase):
+    @staticmethod
+    def facts(name, address, interface='ens192'):
+        return {'hostname': name, 'interfaces': [{'ifname': interface, 'addr_info': [{'local': address}]}]}
+
+    def test_wizard_detects_controller_login_and_reprompts_bad_client_network(self):
+        answers = [''] * 12  # three nodes, then login user, key path and sudo mode
+        answers += ['2', '', '', 'n', '2', '', '', '', '0.0.0.0/24', '198.51.100.42', 'gateway.example.test', '', '']
+        facts = self.facts('IDMVLLMGWP1', '192.0.2.10')
+        with patch.object(cluster, 'local_facts', return_value=facts), patch.object(cluster, 'login_user', return_value='tcmb'), \
+                patch.object(cluster, 'default_key', return_value='/root/.ssh/litellm_cluster'), \
+                patch.object(cluster, 'suggested_address', side_effect=['192.0.2.10', '192.0.2.11', '192.0.2.12']), \
+                patch('builtins.input', side_effect=answers), patch.object(install, 'log'), patch('sys.stdout', new_callable=io.StringIO) as output:
+            p = cluster.wizard()
+        self.assertEqual(p['nodes'][0]['name'], 'IDMVLLMGWP1')
+        self.assertEqual(p['nodes'][1]['interface'], 'auto')
+        self.assertEqual(p['ssh_user'], 'tcmb')
+        self.assertEqual(p['sudo_mode'], 'password')
+        self.assertEqual(p['client_cidrs'], ['198.51.100.42/32'])
+        self.assertEqual(p['services']['postgresql'], 'managed')
+        self.assertEqual(p['frontend'], 'single-node')
+        self.assertEqual(p['tls']['external_ca'], '')
+        self.assertIn('does not mean all clients', output.getvalue())
+
+    def test_all_clients_requires_explicit_confirmation(self):
+        with patch.object(install, 'ask', side_effect=['0.0.0.0/0', '198.51.100.42']), \
+                patch.object(install, 'ask_yes', return_value=False):
+            self.assertEqual(cluster.ask_cidrs('Clients'), ['198.51.100.42/32'])
+
+    def test_auto_interface_and_uppercase_remote_hosts(self):
+        p = plan()
+        p['nodes'][1]['interface'] = p['nodes'][2]['interface'] = 'auto'
+        remote = [SimpleNamespace(stdout=json.dumps(self.facts(n['name'].upper(), n['address'], 'ens224')))
+                  for n in p['nodes'][1:]]
+        with patch.object(cluster, 'local_facts', return_value=self.facts('IDMVLLMGWP1', '192.0.2.10')), \
+                patch.object(cluster.subprocess, 'run', side_effect=remote), patch('sys.stdout', new_callable=io.StringIO):
+            cluster.inspect_nodes(p)
+        self.assertEqual([n['interface'] for n in p['nodes']], ['ens192', 'ens224', 'ens224'])
+
+    def test_worker_accepts_uppercase_hostname_on_owned_retry(self):
+        p = plan()
+        d = {'owner': cluster.OWNER, 'plan_id': cluster.plan_id(p), 'plan': p, 'node': p['nodes'][0],
+             'bundle_sha256': 'test', 'secrets': {'test': 'not-a-real-secret'}}
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / 'ownership.json').write_text(json.dumps(cluster_node.identity(d)))
+            with patch.object(cluster_node, 'ROOT', root), patch.object(install, 'os_release', return_value={'ID': 'rhel', 'VERSION_ID': '9.8'}), \
+                    patch.object(cluster_node.platform, 'machine', return_value='x86_64'), \
+                    patch.object(cluster_node.socket, 'gethostname', return_value='IDMVLLMGWP1'), \
+                    patch.object(cluster_node, 'run', return_value=SimpleNamespace(stdout=json.dumps(self.facts('unused', '192.0.2.10')['interfaces']))):
+                cluster_node.guard(d)
+
+    def test_shared_sudo_password_is_prompted_not_saved_in_command(self):
+        p = plan()
+        p.update(ssh_user='tcmb', sudo_mode='password')
+        command = cluster.playbook_command(p, Path('/work'))
+        self.assertIn('--ask-become-pass', command)
+        p['sudo_mode'] = 'passwordless'
+        self.assertNotIn('--ask-become-pass', cluster.playbook_command(p, Path('/work')))
+
+    def test_ssh_setup_keeps_host_verification_and_installs_only_public_key(self):
+        p = plan()
+        p['ssh_user'] = 'tcmb'
+        with tempfile.TemporaryDirectory() as td:
+            key = Path(td) / 'deploy'
+            key.write_text('test-only')
+            Path(str(key) + '.pub').write_text('test-only-public')
+            p['identity_file'] = str(key)
+            results = [SimpleNamespace(returncode=1, stderr='Host key verification failed')]
+            results += [SimpleNamespace(returncode=0)] * 3
+            with patch.object(cluster, 'interactive', return_value=True), patch.object(install, 'ask_yes', return_value=True), \
+                    patch.object(cluster.subprocess, 'run', side_effect=results) as run, patch('sys.stdout', new_callable=io.StringIO):
+                cluster.prepare_ssh(p)
+            calls = [call.args[0] for call in run.call_args_list]
+            self.assertIn('StrictHostKeyChecking=yes', calls[0])
+            self.assertEqual(calls[1][0], 'ssh-copy-id')
+            self.assertIn(str(key) + '.pub', calls[1])
+            self.assertIn('StrictHostKeyChecking=ask', calls[1])
+            self.assertNotIn(str(key), calls[1])
+
+    def test_plan_only_accepts_case_difference_and_does_not_touch_remote(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            p = plan()
+            p['nodes'][1]['interface'] = 'auto'
+            config = root / 'input.json'
+            config.write_text(json.dumps(p))
+            with patch.object(cluster, 'ROOT', root), patch.object(cluster.os, 'geteuid', return_value=0), \
+                    patch.object(cluster.socket, 'gethostname', return_value='IDMVLLMGWP1'), \
+                    patch.object(cluster, 'prepare_ssh') as ssh, patch.object(cluster, 'ensure_tools') as tools, \
+                    patch('sys.stdout', new_callable=io.StringIO):
+                self.assertEqual(cluster.main(['--config', str(config), '--plan-only']), 0)
+                ssh.assert_not_called()
+                tools.assert_not_called()
+            self.assertEqual(json.loads((root / 'cluster.json').read_text()), p)
+
+    def test_unapplied_invalid_draft_can_be_edited_but_claimed_state_is_locked(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            p = plan()
+            p['client_cidrs'] = ['0.0.0.0/24']
+            (root / 'cluster.json').write_text(json.dumps(p))
+            with patch.object(cluster, 'ROOT', root), patch.object(cluster, 'interactive', return_value=True), \
+                    patch.object(install, 'ask_yes', return_value=True), patch.object(cluster, 'wizard', return_value=plan()) as wizard, \
+                    patch('sys.stdout', new_callable=io.StringIO):
+                self.assertEqual(cluster.select_plan(), plan())
+                wizard.assert_called_once()
+                (root / 'secrets.json').write_text('{}')
+                with self.assertRaises(ValueError):
+                    cluster.select_plan()
+
+    def test_bundle_selection_verifies_sidecar_before_ssh(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / 'bundle.tar'
+            path.write_bytes(b'fake-test-bundle')
+            sidecar = path.with_name(path.name + '.sha256')
+            sidecar.write_text(cluster.sha(path) + '  bundle.tar\n')
+            with patch('sys.stdout', new_callable=io.StringIO):
+                self.assertEqual(cluster.choose_bundle(path), path)
+                path.write_bytes(b'corrupt')
+                with self.assertRaises(ValueError):
+                    cluster.choose_bundle(path)
+
+    def test_full_apply_uses_sudo_prompt_and_saves_no_sudo_credential(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            p = plan()
+            p.update(ssh_user='tcmb', sudo_mode='password')
+            config = root / 'input.json'
+            config.write_text(json.dumps(p))
+            with patch.object(cluster, 'ROOT', root), patch.object(cluster.socket, 'gethostname', return_value='IDMVLLMGWP1'), \
+                    patch.object(cluster, 'ensure_tools'), patch.object(cluster, 'choose_bundle', return_value=root / 'bundle.tar'), \
+                    patch.object(cluster, 'verify_bundle_plan'), patch.object(cluster_node, 'verify_infrastructure'), \
+                    patch.object(cluster, 'prepare_ssh'), patch.object(cluster, 'inspect_nodes'), patch.object(cluster, 'stage'), \
+                    patch.object(cluster, 'new_secrets', return_value={'fake_application_secret': 'test-only'}), \
+                    patch.object(cluster.subprocess, 'run', return_value=SimpleNamespace(returncode=0)) as run, \
+                    patch('sys.stdout', new_callable=io.StringIO):
+                self.assertEqual(cluster.main(['--config', str(config), '--yes']), 0)
+            self.assertIn('--ask-become-pass', run.call_args.args[0])
+            inventory = (root / 'work' / 'inventory.json').read_text()
+            self.assertNotIn('password', inventory)
+            self.assertNotIn('test-only', inventory)
+            self.assertEqual(json.loads((root / 'cluster.json').read_text()), p)
+
+    def test_requested_runtime_must_exist_in_bundle_before_provisioning(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / 'bundle.tar'
+            meta = {'parts': [{'part': 'image', 'litellm_version': 'v1.106.2', 'platform': 'linux/amd64'}]}
+            body = json.dumps(meta).encode()
+            with tarfile.open(path, 'w') as archive:
+                member = tarfile.TarInfo('bundle/BUNDLE.json')
+                member.size = len(body)
+                archive.addfile(member, io.BytesIO(body))
+            p = plan()
+            cluster.verify_bundle_plan(p, path)
+            p['gateway']['mode'] = 'native'
+            with self.assertRaises(ValueError):
+                cluster.verify_bundle_plan(p, path)
+
+
 class ContainerNetworking(unittest.TestCase):
     def test_local_database_proxy_is_reachable(self):
         a = {'host_port': 4000, 'workers': 1, 'node_tls': True, 'cluster_host_network': True}
@@ -185,7 +359,7 @@ class Bundling(unittest.TestCase):
                 self.assertEqual(archive.extractfile('bundle/parts/image/data').read(), b'keep-identical')
                 self.assertEqual(archive.extractfile('bundle/install.py').read(), b'new')
                 self.assertIn(hashlib.sha256(b'new').hexdigest() + '  install.py', archive.extractfile('bundle/SHA256SUMS').read().decode())
-                self.assertEqual(json.load(archive.extractfile('bundle/BUNDLE.json'))['cluster_installer'], '2026-10-22.5')
+                self.assertEqual(json.load(archive.extractfile('bundle/BUNDLE.json'))['cluster_installer'], install.INSTALLER_VERSION)
             self.assertEqual(new.with_name('new.tar.sha256').read_text().split()[0], build_cluster.sha(new))
 
     def test_rejects_corruption_traversal_and_symlinks(self):

@@ -50,7 +50,7 @@ def guard(d):
     osr = i.os_release()
     require(osr.get('ID') == 'rhel' and osr.get('VERSION_ID', '').startswith('9.'), 'RHEL 9 is required')
     require(platform.machine() == 'x86_64', 'Infrastructure payload targets x86_64')
-    require(socket.gethostname().split('.')[0] == n['name'].split('.')[0], 'Wrong host for this plan')
+    require(socket.gethostname().rstrip('.').split('.')[0].casefold() == n['name'].rstrip('.').split('.')[0].casefold(), 'Wrong host for this plan')
     addresses = json.loads(run(['ip', '-j', '-4', 'addr', 'show', 'dev', n['interface']]).stdout)
     require(n['address'] in {a['local'] for entry in addresses for a in entry.get('addr_info', [])},
             'Configured address is not assigned to its interface')

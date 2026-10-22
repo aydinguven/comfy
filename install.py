@@ -51,7 +51,7 @@ import zlib
 from pathlib import Path
 from string import Template
 
-INSTALLER_VERSION = "2026-10-22.5"
+INSTALLER_VERSION = "2026-10-22.6"
 HERE = Path(__file__).resolve().parent
 STAGING = Path("/var/tmp/litellm-installer-parts")       # parts extracted from tars, removed after each run
 SRV = Path("/srv/litellm")

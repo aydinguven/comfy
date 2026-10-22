@@ -4,6 +4,11 @@ Run the coordinator on **idmvllmgwp1**. Default hosts are idmvllmgwp1,
 idmvllmgwp2 and idmvllmgwp3. The wizard requests actual IPv4 addresses, network
 interfaces, SSH identity, service choices and a gateway DNS name.
 
+Installer **2026-10-22.6** adds an interactive setup and fixes case-sensitive
+hostname checks. `IDMVLLMGWP1` and `idmvllmgwp1` identify the same host.
+The controller hostname, resolvable node IPs and SSH login user are suggested.
+Enter `auto` for an interface to detect it over verified SSH before provisioning.
+
 | Component | Existing option | Installer-managed option |
 | --- | --- | --- |
 | PostgreSQL | HA writable endpoint, database owner and trust bundle | PostgreSQL 16, Patroni, three etcd members, synchronous standby |
@@ -50,9 +55,17 @@ Use fresh RHEL 9.8 x86_64 hosts with synchronized clocks, correct DNS and at lea
 20 GiB free under /var/lib. The preflight reserves 4 GiB per gateway worker plus
 infrastructure overhead; size disk and memory for database/cache growth.
 
-Configure SSH keys from the controller/root execution context to nodes 2/3.
-Verify host keys independently and populate known_hosts. The selected user
-needs root or passwordless sudo. Host-key checking is never disabled.
+The coordinator runs with sudo on node 1. SSH can use your normal login account
+(for example `tcmb`) and sudo on nodes 2/3; root SSH is not required. The wizard
+offers a secure shared sudo-password prompt or passwordless sudo. Password mode
+passes `--ask-become-pass` to Ansible; no environment variable is needed and the
+password is not written to the plan, inventory or command line. Both remote
+nodes must accept that shared sudo password.
+
+The wizard can create a dedicated RSA 3072 key and run `ssh-copy-id` interactively.
+Verify displayed SSH host fingerprints independently against the host console
+before accepting them; deployment then requires strict host-key checking.
+With passwordless sudo, you can also prepare access beforehand:
 
     ssh -o BatchMode=yes USER@NODE sudo -n true
 
@@ -61,13 +74,29 @@ Verify and extract the new bundle, then run its installer on idmvllmgwp1:
     sha256sum -c litellm-rhel9.8-x86_64-cluster.tar.sha256
     tar -xf litellm-rhel9.8-x86_64-cluster.tar
     cd litellm-rhel9.8-x86_64
-    sudo python3 install.py cluster \
-      --bundle /absolute/path/litellm-rhel9.8-x86_64-cluster.tar
+    sudo python3.12 install.py cluster
+
+The wizard finds/suggests the tar in this directory or its parent and checks its
+SHA-256 sidecar before SSH setup. Keep both files together. You can still pass
+`--bundle /absolute/path/cluster.tar`. Missing controller prerequisites can be
+installed interactively from entitled RHEL repositories. If started without
+sudo, cluster mode offers to restart with sudo.
 
 The wizard offers both PostgreSQL choices and optional Redis/HAProxy/VIP. It
-displays the plan before applying it. Only builtin Ansible modules are used;
-no Galaxy dependencies are needed. --plan-only validates/saves a plan without
-changing remote nodes. --yes skips only the final apply prompt.
+displays the plan before applying it, with options to apply, edit or save/exit.
+Only builtin Ansible modules are used; no Galaxy dependencies are needed.
+`--plan-only` validates/saves a draft without changing remote nodes or setting up
+SSH. Interfaces marked `auto` are resolved at apply. `--yes` skips only the final
+review, and does not answer SSH, sudo, package-installation or credential prompts.
+
+Client access accepts comma/space-separated IPv4 addresses or CIDRs. A single
+IP becomes `/32`. The SSH client's address is suggested when available; replace
+it if the gateway clients use other networks. Invalid inputs are re-prompted
+immediately. `0.0.0.0/24` is rejected because it covers only `0.0.0.x`; allowing
+all IPv4 addresses (`0.0.0.0/0`) needs an explicit confirmation. No floating VIP
+means the wizard asks whether an external load balancer or a single-node testing
+address will serve clients. Single-node DNS does not provide a HA client address.
+Managed-only services no longer prompt for an external-service CA bundle.
 
 Public plan: /var/lib/litellm-cluster/cluster.json. Shared credentials:
 /var/lib/litellm-cluster/secrets.json (root-only). Back up the credentials and
@@ -76,6 +105,11 @@ work/ca directory to a vault. Reuse them to resume a failed bootstrap:
     sudo python3 install.py cluster \
       --config /var/lib/litellm-cluster/cluster.json \
       --bundle /absolute/path/litellm-rhel9.8-x86_64-cluster.tar
+
+Alternatively rerun `sudo python3.12 install.py cluster` and choose **Resume**.
+Unapplied drafts may be edited with existing answers prefilled. Once provisioning
+has started, plans/credentials remain locked for safe retries. Ctrl-C cancels the
+coordinator and tells you how to resume; remote actions already started may finish.
 
 All nodes pass ownership, data/port conflict, addressing, OS and SSH/sudo checks
 before provisioning. Then the installer stages packages and verified payloads,
