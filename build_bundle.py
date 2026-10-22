@@ -1246,7 +1246,7 @@ PART_HELP = {
     "prisma": "Prisma generated client + CLI from the image, RHEL query/schema engines (native mode)",
     "installer": "install.py and the guides (runs on its own; finds the other parts)",
 }
-INSTALLER_FILES = ["install.py", "GUIDE.md", "RUNBOOK.md"]
+INSTALLER_FILES = ["install.py", "GUIDE.md", "RUNBOOK.md", "CLUSTER.md", "cluster.py", "cluster_node.py", "build_cluster.py", "build_bundle.py"]
 
 
 def now_utc():
