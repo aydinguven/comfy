@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Private cluster worker. Secrets are read from a root-only file, never argv."""
 import hashlib
+import contextlib
+import http.client
+import io
 import importlib.util
 import ipaddress
 import json
@@ -24,6 +27,15 @@ SECRET_FILE = ROOT / 'node.json'
 
 def is_ha(p):
     return len(p['nodes']) == 3
+
+
+def datastore_ha(p):
+    return is_ha(p) and p.get('datastores', 'ha') == 'ha'
+
+
+def managed_here(d, kind):
+    p = d['plan']
+    return p['services'][kind] == 'managed' and (not is_ha(p) or datastore_ha(p) or d.get('node') == p['nodes'][0])
 
 
 def require(ok, message):
@@ -62,19 +74,19 @@ def guard(d):
     if owner.exists():
         require(json.loads(owner.read_text()) == identity(d), 'Cluster plan, bundle or secrets changed; use an explicit migration')
         return
-    reserve = 4 if 'managed' in (p['services']['postgresql'], p['services']['redis']) else 2
+    reserve = 4 if any(managed_here(d, k) for k in ('postgresql', 'redis')) else 2
     require(i.mem_gib() + 0.5 >= p['gateway']['workers'] * 4 + reserve, 'Insufficient RAM for workers and infrastructure')
     require(shutil.disk_usage('/var/lib').free >= 20 * 1024 ** 3, 'Need at least 20 GiB free under /var/lib')
     require(not i.STATE_PATH.exists(), 'Existing LiteLLM deployment needs an explicit migration')
     services, ports = ['litellm'], [4000]
     data = []
-    if p['services']['postgresql'] == 'managed':
-        services += ['postgresql', 'litellm-postgres'] + (['litellm-etcd'] if is_ha(p) else [])
-        ports += [5432] + ([2379, 2380, 6432, 8008] if is_ha(p) else [])
-        data += ['/var/lib/pgsql/data'] + (['/var/lib/litellm-etcd'] if is_ha(p) else [])
-    if p['services']['redis'] == 'managed':
+    if managed_here(d, 'postgresql'):
+        services += ['postgresql', 'litellm-postgres'] + (['litellm-etcd'] if datastore_ha(p) else [])
+        ports += [5432] + ([2379, 2380, 6432, 8008] if datastore_ha(p) else [])
+        data += ['/var/lib/pgsql/data'] + (['/var/lib/litellm-etcd'] if datastore_ha(p) else [])
+    if managed_here(d, 'redis'):
         services += ['redis', 'redis-sentinel', 'litellm-redis', 'litellm-sentinel']
-        ports += [6379] + ([26379] if is_ha(p) else [])
+        ports += [6379] + ([26379] if datastore_ha(p) else [])
         data += ['/var/lib/litellm-redis']
     if p['services']['haproxy']:
         services += ['litellm-haproxy']
@@ -166,13 +178,17 @@ def firewall(d):
     p = d['plan']
     ports = [4000]
     mappings = []
-    if p['services']['postgresql'] == 'managed':
-        if is_ha(p):
+    if managed_here(d, 'postgresql'):
+        if datastore_ha(p):
             ports += [2379, 2380, 5432, 8008]
+        elif is_ha(p):
+            ports += [5432]
         mappings += [('postgresql_etc_t', '/etc/litellm-cluster/postgres(/.*)?')]
-    if p['services']['redis'] == 'managed':
-        if is_ha(p):
+    if managed_here(d, 'redis'):
+        if datastore_ha(p):
             ports += [6379, 26379]
+        elif is_ha(p):
+            ports += [6379]
         mappings += [('redis_conf_t', '/etc/litellm-cluster/redis(/.*)?'),
                      ('redis_var_lib_t', '/var/lib/litellm-redis(/.*)?')]
     rules = set()
@@ -194,9 +210,9 @@ def firewall(d):
         if r.returncode:
             run(['semanage', 'fcontext', '-m', '-t', label, pattern])
     paths = ['/etc/litellm-cluster']
-    if p['services']['redis'] == 'managed':
+    if managed_here(d, 'redis'):
         paths += ['/var/lib/litellm-redis']
-    if p['services']['postgresql'] == 'managed':
+    if managed_here(d, 'postgresql'):
         paths += ['/var/lib/pgsql', '/var/run/postgresql']
     run(['restorecon', '-RF'] + paths)
 
@@ -208,7 +224,7 @@ def context():
 
 
 def init_postgres(d):
-    require(not is_ha(d['plan']) and d['plan']['services']['postgresql'] == 'managed', 'Local initdb requires a single-node managed PostgreSQL plan')
+    require(not datastore_ha(d['plan']) and managed_here(d, 'postgresql'), 'Local initdb requires a managed standalone PostgreSQL host')
     data = Path('/var/lib/pgsql/data')
     version = data / 'PG_VERSION'
     if version.exists():
@@ -235,8 +251,10 @@ def single_database(d):
         try:
             require(psql('SELECT 1;') == '1', 'Local PostgreSQL did not answer')
             break
-        except (RuntimeError, subprocess.SubprocessError):
-            require(time.monotonic() < deadline, 'Local PostgreSQL did not become ready')
+        except (RuntimeError, subprocess.SubprocessError) as exc:
+            detail = (str(getattr(exc, 'stderr', '') or '') or str(exc))[-2000:]
+            require(time.monotonic() < deadline, 'Local PostgreSQL did not become ready: ' + detail +
+                '\nInspect: sudo journalctl -u litellm-postgres -n 40 --no-pager -o cat')
             time.sleep(2)
     def literal(value):
         return "'" + value.replace("'", "''") + "'"
@@ -254,7 +272,7 @@ def single_database(d):
 
 
 def database(d):
-    if not is_ha(d['plan']):
+    if not datastore_ha(d['plan']):
         return single_database(d)
     if not importlib.util.find_spec('psycopg'):
         os.execv('/opt/litellm-patroni/bin/python', ['/opt/litellm-patroni/bin/python', __file__, 'database', str(SECRET_FILE)])
@@ -299,11 +317,12 @@ def database(d):
 def redis_check(d):
     common = ['redis-cli', '--tls', '--cacert', str(ROOT / 'ca.crt'), '--raw']
     deadline = time.monotonic() + 180
-    s = d['secrets']
+    s, last = d['secrets'], 'No successful response'
     while time.monotonic() < deadline:
         try:
-            if not is_ha(d['plan']):
-                result = run(common + ['-h', 'localhost', '-p', '6379', 'SET', 'litellm:installer-health', 'ok', 'EX', '30'],
+            if not datastore_ha(d['plan']):
+                host, port = d['plan']['answers']['redis_nodes'][0]
+                result = run(common + ['-h', host, '-p', str(port), 'SET', 'litellm:installer-health', 'ok', 'EX', '30'],
                     env=dict(os.environ, REDISCLI_AUTH=s['redis']), timeout=10).stdout.strip()
                 require(result == 'OK', 'Local Redis is not writable')
                 return
@@ -322,9 +341,32 @@ def redis_check(d):
                          env=dict(os.environ, REDISCLI_AUTH=s['redis']), timeout=10).stdout.strip()
             require(result == 'OK', 'Redis primary is not writable')
             return
-        except (RuntimeError, subprocess.SubprocessError):
+        except (RuntimeError, subprocess.SubprocessError) as exc:
+            last = str(getattr(exc, 'stderr', '') or '') + str(getattr(exc, 'stdout', '') or '') or str(exc)
             time.sleep(3)
-    raise RuntimeError('Redis' + ('/Sentinel' if is_ha(d['plan']) else '') + ' did not become healthy')
+    raise RuntimeError('Redis' + ('/Sentinel' if datastore_ha(d['plan']) else '') + ' did not become healthy: ' + last[-2000:] +
+        '\nInspect: sudo journalctl -u litellm-redis -n 40 --no-pager -o cat')
+
+
+def package_versions(d):
+    """Switch RPM streams only for an empty managed data directory; never migrate data."""
+    for kind, stream, executable, marker, data in (
+            ('postgresql', 'postgresql:16/server', '/usr/bin/postgres', ' 16.', '/var/lib/pgsql/data'),
+            ('redis', 'redis:7', '/usr/bin/redis-server', 'v=7.', '/var/lib/litellm-redis')):
+        if not managed_here(d, kind):
+            continue
+        ensure_package(kind, stream, executable, marker, data)
+
+
+def ensure_package(kind, stream, executable, marker, data):
+    if Path(executable).exists() and marker in run([executable, '--version']).stdout:
+        return
+    paths = [Path(data)] + ([Path('/var/lib/redis')] if kind == 'redis' else [])
+    for path in paths:
+        require(not path.exists() or not any(path.iterdir()),
+            kind + ': installed package version is incompatible and existing data must be migrated explicitly: ' + str(path))
+    run(['dnf', '-y', 'module', 'switch-to', stream], timeout=900)
+    require(marker in run([executable, '--version']).stdout, kind + ': package stream did not supply required version')
 
 
 def gateway(d):
@@ -360,7 +402,7 @@ def gateway(d):
             secret_changed = True
     a['master_fp'], a['salt_fp'] = i.fingerprint(s['master']), i.fingerprint(s['salt'])
     i.save_json(i.ANSWERS_PATH, a)
-    require(i.run_probe_any(a, ref, has_ca, i.secret_names(a), nm), 'Gateway dependency probe failed')
+    dependency_probe(i, a, ref, has_ca, nm)
     if i.service_active() and changed:
         raise RuntimeError('Running gateway configuration changed; use an explicit rolling upgrade')
     i.apply_and_start(a, state, facts, ref, has_ca, i.secret_names(a), nm, changed or secret_changed)
@@ -370,14 +412,22 @@ def gateway(d):
     i.cleanup_staging()
 
 
+def dependency_probe(installer, answers, ref, has_ca, native):
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        probe_ok = installer.run_probe_any(answers, ref, has_ca, installer.secret_names(answers), native)
+    print(output.getvalue(), end='')
+    require(probe_ok, 'Gateway dependency probe failed:\n' + output.getvalue()[-6000:])
+
+
 def health(d):
     services = []
-    if d['plan']['services']['postgresql'] == 'managed':
-        services += ['litellm-postgres'] + (['litellm-etcd'] if is_ha(d['plan']) else [])
-    if d['plan']['services']['redis'] == 'managed':
-        services += ['litellm-redis'] + (['litellm-sentinel'] if is_ha(d['plan']) else [])
+    if managed_here(d, 'postgresql'):
+        services += ['litellm-postgres'] + (['litellm-etcd'] if datastore_ha(d['plan']) else [])
+    if managed_here(d, 'redis'):
+        services += ['litellm-redis'] + (['litellm-sentinel'] if datastore_ha(d['plan']) else [])
         redis_check(d)
-    if d['plan']['services']['haproxy'] or (is_ha(d['plan']) and d['plan']['services']['postgresql'] == 'managed'):
+    if d['plan']['services']['haproxy'] or (datastore_ha(d['plan']) and d['plan']['services']['postgresql'] == 'managed'):
         services += ['litellm-haproxy']
     if d['plan']['services'].get('vip'):
         services += ['keepalived']
@@ -388,6 +438,30 @@ def health(d):
                         headers={'Authorization': 'Bearer ' + d['secrets']['master']})
         with urllib.request.urlopen(request, context=context(), timeout=15) as response:
             require(response.status == 200, 'Gateway health check failed')
+    if d['plan']['services']['haproxy']:
+        frontend_health(d)
+
+
+def frontend_health(d):
+    """Verify the actual HAProxy route, including certificate hostname and HTTP 503."""
+    ctx = ssl.create_default_context()
+    ctx.load_verify_locations(cafile=str(ROOT / 'ca.crt'))
+    hostname = d['plan']['answers']['fqdn']
+    deadline, last = time.monotonic() + 45, 'No response'
+    while time.monotonic() < deadline:
+        try:
+            with socket.create_connection((d['node']['address'], 443), timeout=10) as raw:
+                with ctx.wrap_socket(raw, server_hostname=hostname) as sock:
+                    sock.sendall(('GET /health/readiness HTTP/1.1\r\nHost: ' + hostname +
+                        '\r\nConnection: close\r\nAuthorization: Bearer ' + d['secrets']['master'] + '\r\n\r\n').encode())
+                    response = http.client.HTTPResponse(sock)
+                    response.begin()
+                    require(response.status == 200, 'HAProxy frontend returned HTTP ' + str(response.status))
+                    return
+        except (OSError, RuntimeError, http.client.HTTPException) as exc:
+            last = str(exc)
+            time.sleep(2)
+    raise RuntimeError('HAProxy frontend is not healthy: ' + last)
 
 
 def main():
@@ -396,15 +470,19 @@ def main():
     require(not SECRET_FILE.is_symlink() and SECRET_FILE.stat().st_uid == 0 and SECRET_FILE.stat().st_mode & 0o077 == 0,
             'Unsafe node-secret permissions')
     d = json.loads(SECRET_FILE.read_text())
-    operations = {'guard': guard, 'claim': claim, 'packages': packages, 'firewall': firewall,
+    operations = {'guard': guard, 'claim': claim, 'packages': packages, 'package-versions': package_versions, 'firewall': firewall,
                   'init-postgres': init_postgres, 'database': database, 'redis-check': redis_check, 'gateway': gateway, 'check': health}
     require(sys.argv[1] in operations, 'Unknown worker phase')
     try:
+        # Avoid reporting an older failed phase after the next phase starts.
+        (ROOT / 'last-error.txt').unlink(missing_ok=True)
         operations[sys.argv[1]](d)
         print(sys.argv[1] + ': OK')
         return 0
     except Exception as exc:
         message = str(exc)
+        if isinstance(exc, subprocess.CalledProcessError):
+            message += '\n' + str(exc.stdout or '')[-3000:] + '\n' + str(exc.stderr or '')[-3000:]
         for value in d['secrets'].values():
             for variant in (value, urllib.parse.quote(value, safe='')):
                 message = message.replace(variant, '[redacted]')

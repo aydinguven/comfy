@@ -123,7 +123,7 @@ class Rendering(unittest.TestCase):
         self.assertLess(names.index('Install and health-check gateways sequentially'), names.index('Activate VIP after all gateways are healthy'))
         self.assertEqual(next(x for x in plays if x['name'].startswith('Install and health-check'))['serial'], 1)
         copies = [t['ansible.builtin.copy'] for x in plays for t in x['tasks'] if 'ansible.builtin.copy' in t]
-        mutable = [x for x in copies if x['dest'].endswith(('redis.conf', 'sentinel.conf'))]
+        mutable = [x for x in copies if x['dest'].endswith(('/redis.conf', '/sentinel.conf'))]
         self.assertEqual(len(mutable), 2)
         self.assertTrue(all(x['force'] is False for x in mutable))
 

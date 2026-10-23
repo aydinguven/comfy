@@ -51,7 +51,7 @@ import zlib
 from pathlib import Path
 from string import Template
 
-INSTALLER_VERSION = "2026-10-23.1"
+INSTALLER_VERSION = "2026-10-23.2"
 HERE = Path(__file__).resolve().parent
 STAGING = Path("/var/tmp/litellm-installer-parts")       # parts extracted from tars, removed after each run
 SRV = Path("/srv/litellm")
@@ -2935,7 +2935,13 @@ def cmd_status(args):
     answers, state = load_json(ANSWERS_PATH), load_json(STATE_PATH)
     step("Status")
     if not state.get("ref"):
-        say("  not installed on this node")
+        say("  gateway bootstrap is not complete on this node")
+        error = Path('/var/lib/litellm-cluster/last-error.txt')
+        if error.is_file():
+            say(error.read_text()[-8000:])
+        say("  Bootstrap diagnostics: /var/lib/litellm-cluster/last-error.txt")
+        say("  Detailed probe checks: /var/log/litellm-installer.log (look for [FAIL])")
+        say("  Rootless service: sudo systemctl --user -M litellm@ status litellm --no-pager -l")
         return
     RUNTIME["mode"] = state.get("mode", "container")
     say(f"  mode           {mode()}")

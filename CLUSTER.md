@@ -1,10 +1,30 @@
 # Guided single-node or three-node installation
 
-Installer **2026-10-23.1** starts with a deployment-size choice. Run:
+Installer **2026-10-23.2** starts with a deployment-size choice. Run:
 
     sudo python3.12 install.py setup
 
 `install.py cluster` remains an alias for the same wizard.
+
+## Three gateways with PostgreSQL and Redis on node 1
+
+Choose **3 — Three LiteLLM gateways: PostgreSQL and Redis on node 1**. Run the
+controller on node 1, log into nodes 2/3 as your normal SSH user (such as `tcmb`),
+and choose password-based or passwordless sudo. The wizard offers managed or
+external PostgreSQL and Redis independently, and optional HAProxy/Keepalived.
+
+With managed services, node 1 runs PostgreSQL 16 and standalone Redis 7 with
+TLS/password authentication and AOF. Nodes 2/3 run no managed PostgreSQL, Redis,
+Patroni, etcd or Sentinel. All gateways use node 1's actual IPv4 address on
+5432/6379. PostgreSQL's HBA and firewalld admit only the three gateway IPs;
+database ports are not opened on nodes 2/3. Redis has no replica-write quorum.
+The application payload supports both rootless Podman and native Python.
+
+**This is not database/cache HA.** Losing node 1 interrupts every gateway's
+database/cache access. HAProxy or a VIP does not remove that dependency. Use the
+three-node HA option or existing HA services when datastore failover is required.
+An existing single-node deployment is not automatically expanded or migrated by
+this option; deployment-size/placement changes remain locked after provisioning.
 
 ## Single node
 
@@ -74,13 +94,16 @@ hashes during installation. Use --infrastructure to reuse a verified directory.
 
 --without-managed-postgresql omits the Patroni/etcd payload, while retaining the
 external PostgreSQL, single-node local PostgreSQL, Redis, HAProxy and VIP
-options. Three-node managed PostgreSQL cannot be selected without its offline
+options. Replicated three-node managed PostgreSQL cannot be selected without its offline
 Patroni/etcd payload.
 
 **RHEL RPMs are not embedded.** Nodes require entitled BaseOS/AppStream or
 Satellite repositories/local mirrors. The controller requires ansible-core and
 openssl from its repositories. Managed Redis uses redis:7, managed PostgreSQL
-uses postgresql:16/server. The installer never resets an existing module stream.
+uses postgresql:16/server. For an empty managed data directory the installer
+selects the required stream with `dnf module switch-to`; an installed PostgreSQL
+13 binary is no longer silently retained. It refuses to switch an incompatible
+package version when data exists. This is not a PostgreSQL/Redis data upgrade.
 
 ## Deploy from node 1
 
@@ -173,6 +196,25 @@ peer-scoped VRRP. Existing broad firewall rules are not removed; audit them.
 SELinux remains enabled. Selecting any managed proxy enables the RHEL
 haproxy_connect_any boolean; this appears in the apply summary. Redis/PostgreSQL
 paths receive distribution service/data labels. Validate those labels on RHEL.
+PostgreSQL/Redis units use `NoNewPrivileges=false` to allow the distribution's
+normal SELinux domain transition; filesystem sandboxing remains enabled.
+Managed Redis hosts set `vm.overcommit_memory=1` persistently. Changed service
+units/certificates trigger service restarts on bootstrap retries; unchanged
+Redis/Sentinel failover configuration is preserved.
+
+Certificates include explicit critical CA constraints/key usage. The controller
+offers the bundled CA extension repair when resuming an older CA without keyUsage.
+Strict server/client certificate validation runs before staging. The reset and
+CA-repair helpers are included in the bundle with their own documented checks.
+
+Final health includes the actual HTTPS HAProxy readiness route with hostname
+and CA verification and a short convergence wait. HTTP 503 prevents a successful
+result. For an incomplete gateway, `sudo python3.12 install.py status` points to
+the redacted worker error and detailed probe log; it does not incorrectly imply
+that a missing system-level service is necessarily a failed rootless service.
+For an existing organization-signed frontend certificate, install its issuing
+CA in each node's system trust store before setup; the frontend check uses
+system trust plus the installer CA.
 
 System services: litellm-etcd, litellm-postgres, litellm-redis, litellm-sentinel,
 litellm-haproxy, and optionally keepalived. LiteLLM itself uses its existing

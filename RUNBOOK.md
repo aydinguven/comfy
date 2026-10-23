@@ -1,7 +1,9 @@
 # LiteLLM operations
 
 See CLUSTER.md for single-node/HA setup, bootstrap retries, infrastructure
-services and failover checks. Installer 2026-10-23.1 adds the deployment-size
+services and failover checks. Installer 2026-10-23.2 includes the RHEL bootstrap
+fixes in CHANGELOG.md and three gateways with PostgreSQL/Redis on node 1. The
+deployment-size
 choice through `sudo python3.12 install.py setup` (`cluster` remains an alias).
 Single-node services use litellm-postgres, litellm-redis and optional
 litellm-haproxy; they have no automatic failover. Resume with the same plan and
@@ -33,7 +35,8 @@ services. For an existing live deployment, use a separate maintenance plan;
 this procedure targets the failed bootstrap. It is not CA/key rotation or
 certificate renewal. Source certificate generation includes the required
 extensions; previously published release bundles are unchanged by this source
-fix. Run PKI/repair regression tests with `python3 -m unittest -v test_pki`.
+fix. The setup-v4 bundle includes the source fix and repair helper; old published
+bundles remain unchanged. Run PKI/repair tests with `python3 -m unittest -v test_pki`.
 
 For a deliberate fresh start on one host, use [reset-litellm.sh](reset-litellm.sh):
 
@@ -63,6 +66,24 @@ unapplied draft can be edited; an attempted deployment retains its plan/secrets.
 
 Answers/state are in /srv/litellm. Installer logs are in
 /var/log/litellm-installer.log. Share only redacted logs.
+
+When Ansible hides a worker failure, inspect its host's
+`/var/lib/litellm-cluster/last-error.txt` first. Gateway errors now include the
+failing dependency checks, with saved secrets redacted. PostgreSQL/Redis startup
+logs are under `journalctl -u litellm-postgres` / `journalctl -u litellm-redis`.
+Rootless LiteLLM is a user unit: `sudo systemctl --user -M litellm@ status litellm`;
+native LiteLLM is `sudo systemctl status litellm`. An HTTP 503 from HAProxy is a
+backend health/routing problem; use installer status and `journalctl -u
+litellm-haproxy` before changing credentials.
+
+First UI login is username `admin`, password the existing master key. On the
+controller display only that value locally, never the entire secrets file:
+
+    sudo python3.12 -c 'import json; print(json.load(open("/var/lib/litellm-cluster/secrets.json"))["master"])'
+
+Keep that key private. After logging in, create a named proxy-admin account.
+The installer completion message explains the initial login without printing
+credentials.
 
 For rolling LiteLLM upgrades, back up the database, read release notes, drain
 one gateway from the load balancer and run:

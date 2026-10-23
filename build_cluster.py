@@ -21,7 +21,8 @@ from install import INSTALLER_VERSION
 HERE = Path(__file__).resolve().parent
 ETCD_VERSION = 'v3.6.7'
 ETCD_SHA256 = 'cf8af880c5a01ee5363cefa14a3e0cb7e5308dcf4ed17a6973099c9a7aee5a9a'
-FILES = ('install.py', 'build_bundle.py', 'cluster.py', 'cluster_node.py', 'build_cluster.py', 'GUIDE.md', 'RUNBOOK.md', 'CLUSTER.md')
+FILES = ('install.py', 'build_bundle.py', 'cluster.py', 'cluster_node.py', 'build_cluster.py',
+    'repair-litellm-ca.sh', 'reset-litellm.sh', 'README.md', 'GUIDE.md', 'RUNBOOK.md', 'CLUSTER.md', 'CHANGELOG.md', 'UPDATE.md')
 
 
 def sha(path):

@@ -1,10 +1,15 @@
 # LiteLLM on RHEL 9.8
 
-Offline application bundles with guided single-node or three-node HA bootstrap.
+Offline application bundles with guided single-node, three-node HA, or three
+gateway bootstrap with PostgreSQL and Redis on node 1. Installer **2026-10-23.2**.
 The HA defaults are `idmvllmgwp1`, `idmvllmgwp2` and `idmvllmgwp3`.
 
 Run `sudo python3.12 install.py setup` on the target host/controller and choose
 **Single node** or **Three-node HA**. `cluster` remains a command alias.
+The third choice, **Three LiteLLM gateways: PostgreSQL and Redis on node 1**,
+deploys LiteLLM on all three nodes and managed standalone PostgreSQL/Redis only
+on node 1. It also offers existing external services. Node 1 is a single point
+of failure for managed databases; this option does not provide datastore HA.
 Single-node mode offers local PostgreSQL 16 and Redis 7 or existing external
 services, optional HAProxy, and no SSH/VIP/quorum setup. The interactive wizard detects
 hostname/IP/interface defaults, supports SSH as your login user followed by sudo,
@@ -21,6 +26,8 @@ archive tests; actual RHEL deployment and failover validation remain required.
 
 For individual gateways, see [GUIDE.md](GUIDE.md) and [RUNBOOK.md](RUNBOOK.md).
 Run source tests with `python3 -m unittest -v test_cluster`.
+See [CHANGELOG.md](CHANGELOG.md) for the RHEL bootstrap fixes. Run all regressions
+with `python3 -m unittest -v test_cluster test_pki test_reset test_setup`.
 
 If gateway checks fail with **CA cert does not include key usage extension**,
 run [repair-litellm-ca.sh](repair-litellm-ca.sh) on the controller, then resume
