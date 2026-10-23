@@ -1,0 +1,43 @@
+[root@IDMVLLMGWP1 ~]# python3.12 /home/tcmb/migration-precheck.py 
+{
+  "nodes": [
+    {
+      "name": "IDMVLLMGWP1",
+      "address": "10.255.15.119",
+      "interface": "ens33"
+    }
+  ],
+  "datastores": "local",
+  "services": {
+    "postgresql": "managed",
+    "redis": "managed",
+    "haproxy": true,
+    "vip_enabled": false
+  },
+  "gateway": {
+    "mode": "container",
+    "workers": 1,
+    "version": "v1.106.2"
+  },
+  "fqdn": "idmvllmgwp1.tcmb.gov.tr",
+  "pg_host": "localhost",
+  "pg_port": 5432,
+  "redis_topology": "standalone",
+  "redis_nodes": [
+    [
+      "localhost",
+      6379
+    ]
+  ],
+  "runtime_mode": "container",
+  "gateway_service": "active",
+  "infrastructure_services": {
+    "litellm-postgres": "active",
+    "litellm-redis": "active",
+    "litellm-haproxy": "active"
+  },
+  "local_readiness": {
+    "http_status": 200,
+    "result": "ready"
+  }
+}
