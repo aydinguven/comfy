@@ -59,8 +59,18 @@ Append the output below and commit this file. Do not paste passwords or keys.
 Do not change the saved single-node plan or select a fresh three-node install yet.
 
 NEXT CHECK OUTPUT:
-(paste here)
+Existing SSH private key path [/root/.ssh/litellm_cluster] (blank default uses agent/default keys): 
 
+NODE idmvllmgwp2
+No ED25519 host key is known for idmvllmgwp2 and you have requested strict checking.
+Host key verification failed.
+SSH_CHECK=FAILED for idmvllmgwp2
+
+NODE idmvllmgwp3
+No ED25519 host key is known for idmvllmgwp3 and you have requested strict checking.
+Host key verification failed.
+SSH_CHECK=FAILED for idmvllmgwp3
+[root@IDMVLLMGWP1 ~]# 
 PREVIOUS OUTPUT (kept for reference):
 
 [root@IDMVLLMGWP1 ~]# python3.12 /home/tcmb/migration-precheck.py 
