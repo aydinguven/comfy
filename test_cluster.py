@@ -28,6 +28,16 @@ def plan():
             'redis_service_name': 'litellm', 'redis_sentinel_auth': True, 'redis_username': '', 'redis_auth': True, 'redis_tls': True, 'model_urls': []}}
 
 
+def single_plan():
+    p = plan()
+    p['nodes'] = p['nodes'][:1]
+    p['services']['vip'] = None
+    p.update(ssh_user='root', identity_file='', sudo_mode='passwordless', frontend='single-node')
+    p['answers'].update(node_count=1, pg_port=5432, lb_cidrs=['192.0.2.10/32'], redis_topology='standalone',
+        redis_nodes=[['localhost', 6379]], redis_service_name='', redis_sentinel_auth=False)
+    return p
+
+
 class Validation(unittest.TestCase):
     def test_case_insensitive_host_identity_and_duplicates(self):
         self.assertTrue(cluster.same_host('IDMVLLMGWP1.example.test', 'idmvllmgwp1'))
@@ -140,7 +150,7 @@ class InteractiveBootstrap(unittest.TestCase):
         return {'hostname': name, 'interfaces': [{'ifname': interface, 'addr_info': [{'local': address}]}]}
 
     def test_wizard_detects_controller_login_and_reprompts_bad_client_network(self):
-        answers = [''] * 12  # three nodes, then login user, key path and sudo mode
+        answers = ['2'] + [''] * 12  # HA topology, three nodes, login user, key and sudo mode
         answers += ['2', '', '', 'n', '2', '', '', '', '0.0.0.0/24', '198.51.100.42', 'gateway.example.test', '', '']
         facts = self.facts('IDMVLLMGWP1', '192.0.2.10')
         with patch.object(cluster, 'local_facts', return_value=facts), patch.object(cluster, 'login_user', return_value='tcmb'), \
@@ -292,6 +302,172 @@ class InteractiveBootstrap(unittest.TestCase):
             p['gateway']['mode'] = 'native'
             with self.assertRaises(ValueError):
                 cluster.verify_bundle_plan(p, path)
+
+
+class SingleNode(unittest.TestCase):
+    def test_managed_and_external_services_and_both_runtimes(self):
+        import itertools
+        for pg, redis, proxy, runtime in itertools.product(('managed', 'external'), ('managed', 'external'), (True, False), ('container', 'native')):
+            p = single_plan()
+            p['services'].update(postgresql=pg, redis=redis, haproxy=proxy)
+            p['gateway']['mode'] = runtime
+            if not proxy:
+                p['frontend'] = 'direct'
+                p['answers']['lb_cidrs'] = []
+            if pg == 'external':
+                p['answers']['pg_host'] = 'database.example.test'
+            if redis == 'external':
+                p['answers']['redis_nodes'] = [['cache.example.test', 6379]]
+            with self.subTest(pg=pg, redis=redis, proxy=proxy, runtime=runtime):
+                cluster.validate(p)
+                hosts = cluster.inventory(p)['all']['children']['gateways']['hosts']
+                self.assertEqual(len(hosts), 1)
+                self.assertEqual(next(iter(hosts.values()))['ansible_connection'], 'local')
+                plays = json.dumps(cluster.playbook(p, Path('/work'), Path('/bundle.tar'), Path('/infra')))
+                for forbidden in ('litellm-etcd', 'litellm-sentinel', 'patroni', 'keepalived', 'Stage offline infrastructure'):
+                    self.assertNotIn(forbidden, plays)
+                self.assertEqual('Initialize local PostgreSQL' in plays, pg == 'managed')
+                self.assertEqual('Start local Redis' in plays, redis == 'managed')
+                self.assertEqual('Validate HAProxy' in plays, proxy)
+
+    def test_single_node_has_no_vip_or_ha_database_endpoints(self):
+        for change in (lambda p: p['services'].update(vip={'address': '192.0.2.20/24', 'router_id': 51}),
+                lambda p: p['answers'].update(pg_port=6432),
+                lambda p: p['answers'].update(redis_topology='sentinel'),
+                lambda p: p['nodes'].append({'name': 'node2', 'address': '192.0.2.11', 'interface': 'ens192'})):
+            p = single_plan()
+            change(p)
+            with self.assertRaises(ValueError):
+                cluster.validate(p)
+
+    def test_single_apply_needs_no_ssh_or_patroni_payload(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            p = single_plan()
+            config = root / 'input.json'
+            config.write_text(json.dumps(p))
+            facts = InteractiveBootstrap.facts('IDMVLLMGWP1', '192.0.2.10')
+            with patch.object(cluster, 'ROOT', root), patch.object(cluster.socket, 'gethostname', return_value='IDMVLLMGWP1'), \
+                    patch.object(cluster, 'local_facts', return_value=facts), patch.object(cluster, 'ensure_tools'), \
+                    patch.object(cluster, 'choose_bundle', return_value=root / 'bundle.tar'), patch.object(cluster, 'verify_bundle_plan'), \
+                    patch.object(cluster_node, 'verify_infrastructure') as infrastructure, patch.object(cluster, 'stage'), \
+                    patch.object(cluster, 'new_secrets', return_value={'fake': 'test-only'}), \
+                    patch.object(cluster.subprocess, 'run', return_value=SimpleNamespace(returncode=0)) as run, \
+                    patch('sys.stdout', new_callable=io.StringIO):
+                self.assertEqual(cluster.main(['--config', str(config), '--yes']), 0)
+                infrastructure.assert_not_called()
+            self.assertEqual(run.call_count, 1)
+            self.assertEqual(run.call_args.args[0][0], 'ansible-playbook')
+            self.assertNotIn('--ask-become-pass', run.call_args.args[0])
+            hosts = json.loads((root / 'work' / 'inventory.json').read_text())['all']['children']['gateways']['hosts']
+            self.assertEqual(len(hosts), 1)
+            self.assertEqual(next(iter(hosts.values()))['ansible_connection'], 'local')
+
+    def test_interactive_single_node_skips_ssh_and_quorum_questions(self):
+        answers = ['1', '', '', '', '', '', '', '', '', '', '198.51.100.42', 'gateway.example.test', '', '']
+        prompts = []
+        def respond(prompt):
+            prompts.append(prompt)
+            return answers.pop(0)
+        facts = InteractiveBootstrap.facts('IDMVLLMGWP1', '192.0.2.10')
+        with patch.object(cluster, 'local_facts', return_value=facts), patch.object(cluster, 'suggested_address', return_value='192.0.2.10'),                 patch.object(cluster, 'ask_ssh') as ssh, patch('builtins.input', side_effect=respond), patch.object(install, 'log'),                 patch('sys.stdout', new_callable=io.StringIO):
+            p = cluster.wizard()
+        ssh.assert_not_called()
+        self.assertEqual(len(p['nodes']), 1)
+        self.assertEqual(p['answers']['node_count'], 1)
+        self.assertEqual(p['answers']['pg_port'], 5432)
+        self.assertEqual(p['answers']['redis_topology'], 'standalone')
+        self.assertEqual(p['services']['postgresql'], 'managed')
+        self.assertFalse(p['services']['vip'])
+        self.assertFalse(any('VIP' in prompt or 'SSH login' in prompt for prompt in prompts))
+        with patch.object(cluster.subprocess, 'run') as run:
+            cluster.prepare_ssh(p)
+            run.assert_not_called()
+
+    def test_standalone_services_are_writable_and_bound_to_loopback(self):
+        p = single_plan()
+        redis = cluster.redis_config(p, p['nodes'][0], {'redis': 'test-only'})
+        self.assertIn('bind 127.0.0.1\n', redis)
+        self.assertIn('min-replicas-to-write 0', redis)
+        self.assertNotIn('replicaof', redis)
+        self.assertIn('port 0\n', redis)
+        pg, hba = cluster.single_postgres_config(p)
+        self.assertIn("listen_addresses = '127.0.0.1'", pg)
+        self.assertIn("synchronous_standby_names = ''", pg)
+        self.assertIn('hostssl litellm litellm 127.0.0.1/32 scram-sha-256', hba)
+        self.assertNotIn('trust', hba)
+        proxy = cluster.haproxy_config(p)
+        self.assertNotIn('postgres_primary', proxy)
+        self.assertNotIn('8008', proxy)
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            bundle = root / 'bundle.tar'
+            bundle.write_bytes(b'test')
+            with patch.object(cluster, 'pki'):
+                cluster.stage(p, {'redis': 'test-only'}, root, bundle)
+            files = {f.name for f in (root / p['nodes'][0]['name']).iterdir()}
+            self.assertTrue({'postgresql.conf', 'pg_hba.conf', 'redis.conf', 'litellm-postgres.service'} <= files)
+            self.assertFalse({'etcd.json', 'postgres.json', 'sentinel.conf', 'keepalived.conf'} & files)
+            unit = (root / p['nodes'][0]['name'] / 'litellm-postgres.service').read_text()
+            self.assertIn('RuntimeDirectory=postgresql', unit)
+
+    def test_direct_clients_are_not_trusted_proxies_and_no_database_ports_open(self):
+        p = single_plan()
+        p['services']['haproxy'] = False
+        p['frontend'] = 'direct'
+        p['answers']['lb_cidrs'] = []
+        cluster.validate(p)
+        with patch.object(cluster_node, 'run') as run,                 patch.object(cluster_node.subprocess, 'run', return_value=SimpleNamespace(returncode=0)):
+            cluster_node.firewall({'plan': p})
+        commands = [call.args[0] for call in run.call_args_list]
+        rules = ' '.join(' '.join(command) for command in commands if command[0] == 'firewall-cmd')
+        self.assertIn('198.51.100.0/24', rules)
+        self.assertIn('4000', rules)
+        for port in ('5432', '6379', '2379', '2380', '8008', '26379'):
+            self.assertNotIn(port, rules)
+        config = install.render_config(p['answers'], True)
+        self.assertIn('trusted_proxy_ranges: []', config)
+
+    def test_database_bootstrap_and_retry_use_no_patroni_or_replication(self):
+        p = single_plan()
+        d = {'plan': p, 'secrets': {'database': "test'only-password"}}
+        with patch.object(cluster_node, 'psql', side_effect=['1', '', '', '', '', 'litellm']) as psql:
+            cluster_node.database(d)
+        queries = [call.args[0] for call in psql.call_args_list]
+        self.assertIn("test''only-password", ' '.join(queries))
+        self.assertTrue(any('CREATE DATABASE' in query for query in queries))
+        self.assertNotIn('pg_stat_replication', ' '.join(queries))
+        with patch.object(cluster_node, 'psql', side_effect=['1', '1', '1', 'litellm']) as psql:
+            cluster_node.database(d)
+        self.assertFalse(any('CREATE ' in call.args[0] for call in psql.call_args_list))
+        with patch.object(cluster_node, 'run', return_value=SimpleNamespace(stdout='')) as run:
+            cluster_node.psql("CREATE ROLE example LOGIN PASSWORD 'test-secret';")
+        self.assertNotIn('test-secret', ' '.join(run.call_args.args[0]))
+        self.assertIn('test-secret', run.call_args.kwargs['input'])
+
+    def test_local_redis_health_needs_no_sentinel(self):
+        with patch.object(cluster_node, 'run', return_value=SimpleNamespace(stdout='OK\n')) as run:
+            cluster_node.redis_check({'plan': single_plan(), 'secrets': {'redis': 'test-only'}})
+        command = run.call_args.args[0]
+        self.assertIn('SET', command)
+        self.assertIn('localhost', command)
+        self.assertNotIn('SENTINEL', command)
+        self.assertEqual(run.call_args.kwargs['env']['REDISCLI_AUTH'], 'test-only')
+
+    def test_initdb_is_not_repeated_on_existing_version16_data(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            d = {'plan': single_plan()}
+            with patch.object(cluster_node, 'Path', return_value=root), patch.object(cluster_node, 'run') as run:
+                cluster_node.init_postgres(d)
+                self.assertIn('--auth-host=scram-sha-256', run.call_args_list[0].args[0])
+                (root / 'PG_VERSION').write_text('16\n')
+                run.reset_mock()
+                cluster_node.init_postgres(d)
+                run.assert_not_called()
+                (root / 'PG_VERSION').write_text('15\n')
+                with self.assertRaises(RuntimeError):
+                    cluster_node.init_postgres(d)
 
 
 class ContainerNetworking(unittest.TestCase):

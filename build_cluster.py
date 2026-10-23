@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Add cluster support and optional offline PostgreSQL HA dependencies to a verified application tar."""
+"""Add guided single-node/HA setup and optional PostgreSQL HA dependencies to a verified application tar."""
 import argparse
 import email.parser
 import hashlib
@@ -125,7 +125,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--bundle', type=Path, required=True, help='Verified existing application tar')
     p.add_argument('--out', type=Path, required=True, help='New cluster-enabled tar')
-    p.add_argument('--without-managed-postgresql', action='store_true', help='Omit Patroni/etcd; external PostgreSQL and other services still available')
+    p.add_argument('--without-managed-postgresql', action='store_true', help='Omit Patroni/etcd; single-node local PostgreSQL and external services remain available')
     p.add_argument('--infrastructure', type=Path, help='Reuse a verified offline infrastructure directory')
     a = p.parse_args()
     try:

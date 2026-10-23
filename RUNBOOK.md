@@ -1,6 +1,12 @@
 # LiteLLM operations
 
-See CLUSTER.md for bootstrap retries, infrastructure services and failover checks.
+See CLUSTER.md for single-node/HA setup, bootstrap retries, infrastructure
+services and failover checks. Installer 2026-10-23.1 adds the deployment-size
+choice through `sudo python3.12 install.py setup` (`cluster` remains an alias).
+Single-node services use litellm-postgres, litellm-redis and optional
+litellm-haproxy; they have no automatic failover. Resume with the same plan and
+bundle. Switching an existing deployment between one and three nodes is a
+migration, not a bootstrap retry.
 
 For installer 2026-10-22.6, rerun `sudo python3.12 install.py cluster` on node 1
 and choose Resume. Sudo-password prompts are selected in the wizard; an

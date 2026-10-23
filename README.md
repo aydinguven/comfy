@@ -1,9 +1,12 @@
 # LiteLLM on RHEL 9.8
 
-Offline application bundles and a three-node HA bootstrap installer for
-`idmvllmgwp1`, `idmvllmgwp2` and `idmvllmgwp3`.
+Offline application bundles with guided single-node or three-node HA bootstrap.
+The HA defaults are `idmvllmgwp1`, `idmvllmgwp2` and `idmvllmgwp3`.
 
-Run `sudo python3.12 install.py cluster` on node 1. The interactive wizard detects
+Run `sudo python3.12 install.py setup` on the target host/controller and choose
+**Single node** or **Three-node HA**. `cluster` remains a command alias.
+Single-node mode offers local PostgreSQL 16 and Redis 7 or existing external
+services, optional HAProxy, and no SSH/VIP/quorum setup. The interactive wizard detects
 hostname/IP/interface defaults, supports SSH as your login user followed by sudo,
 offers SSH key setup and a secure sudo-password prompt, and lets you edit or
 resume a saved plan. Hostname checks ignore case. The wizard offers existing or managed

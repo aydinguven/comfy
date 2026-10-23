@@ -22,6 +22,10 @@ ROOT = Path('/var/lib/litellm-cluster')
 SECRET_FILE = ROOT / 'node.json'
 
 
+def is_ha(p):
+    return len(p['nodes']) == 3
+
+
 def require(ok, message):
     if not ok:
         raise RuntimeError(message)
@@ -65,12 +69,12 @@ def guard(d):
     services, ports = ['litellm'], [4000]
     data = []
     if p['services']['postgresql'] == 'managed':
-        services += ['postgresql', 'litellm-postgres', 'litellm-etcd']
-        ports += [2379, 2380, 5432, 6432, 8008]
-        data += ['/var/lib/pgsql/data', '/var/lib/litellm-etcd']
+        services += ['postgresql', 'litellm-postgres'] + (['litellm-etcd'] if is_ha(p) else [])
+        ports += [5432] + ([2379, 2380, 6432, 8008] if is_ha(p) else [])
+        data += ['/var/lib/pgsql/data'] + (['/var/lib/litellm-etcd'] if is_ha(p) else [])
     if p['services']['redis'] == 'managed':
         services += ['redis', 'redis-sentinel', 'litellm-redis', 'litellm-sentinel']
-        ports += [6379, 26379]
+        ports += [6379] + ([26379] if is_ha(p) else [])
         data += ['/var/lib/litellm-redis']
     if p['services']['haproxy']:
         services += ['litellm-haproxy']
@@ -163,10 +167,12 @@ def firewall(d):
     ports = [4000]
     mappings = []
     if p['services']['postgresql'] == 'managed':
-        ports += [2379, 2380, 5432, 8008]
+        if is_ha(p):
+            ports += [2379, 2380, 5432, 8008]
         mappings += [('postgresql_etc_t', '/etc/litellm-cluster/postgres(/.*)?')]
     if p['services']['redis'] == 'managed':
-        ports += [6379, 26379]
+        if is_ha(p):
+            ports += [6379, 26379]
         mappings += [('redis_conf_t', '/etc/litellm-cluster/redis(/.*)?'),
                      ('redis_var_lib_t', '/var/lib/litellm-redis(/.*)?')]
     rules = set()
@@ -175,7 +181,8 @@ def firewall(d):
             rules.add('rule family="ipv4" source address="' + n['address'] + '/32" port port="' + str(port) + '" protocol="tcp" accept')
         if p['services'].get('vip'):
             rules.add('rule family="ipv4" source address="' + n['address'] + '/32" protocol value="vrrp" accept')
-    sources, port = (p['client_cidrs'], 443) if p['services']['haproxy'] else (p['answers']['lb_cidrs'], 4000)
+    sources, port = (p['client_cidrs'], 443) if p['services']['haproxy'] else (
+        (p['client_cidrs'] if p.get('frontend') == 'direct' else p['answers']['lb_cidrs']), 4000)
     for cidr in sources:
         ipaddress.ip_network(cidr, strict=True)
         rules.add('rule family="ipv4" source address="' + cidr + '" port port="' + str(port) + '" protocol="tcp" accept')
@@ -200,7 +207,55 @@ def context():
     return ctx
 
 
+def init_postgres(d):
+    require(not is_ha(d['plan']) and d['plan']['services']['postgresql'] == 'managed', 'Local initdb requires a single-node managed PostgreSQL plan')
+    data = Path('/var/lib/pgsql/data')
+    version = data / 'PG_VERSION'
+    if version.exists():
+        require(version.read_text().strip() == '16', 'Existing PostgreSQL data is not version 16')
+        return
+    require(not any(data.iterdir()), 'Incomplete/existing PostgreSQL data found; inspect it before retrying initdb')
+    run(['runuser', '-u', 'postgres', '--', '/usr/bin/initdb', '-D', str(data), '--encoding=UTF8',
+         '--auth-local=peer', '--auth-host=scram-sha-256', '--data-checksums'], timeout=180)
+    run(['restorecon', '-RF', str(data)])
+
+
+def psql(query):
+    # The password is carried over stdin, never argv or an environment variable.
+    env = {k: v for k, v in os.environ.items() if not k.startswith('PG')}
+    return run(['runuser', '-u', 'postgres', '--', '/usr/bin/psql', '-X', '-q', '-A', '-t',
+        '-v', 'ON_ERROR_STOP=1', '-h', '/var/run/postgresql', '-p', '5432', '-U', 'postgres', '-d', 'postgres'],
+        input=query, env=env, timeout=30).stdout.strip()
+
+
+def single_database(d):
+    a, s = d['plan']['answers'], d['secrets']
+    deadline = time.monotonic() + 120
+    while True:
+        try:
+            require(psql('SELECT 1;') == '1', 'Local PostgreSQL did not answer')
+            break
+        except (RuntimeError, subprocess.SubprocessError):
+            require(time.monotonic() < deadline, 'Local PostgreSQL did not become ready')
+            time.sleep(2)
+    def literal(value):
+        return "'" + value.replace("'", "''") + "'"
+    def identifier(value):
+        import re
+        require(re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]{0,62}', value), 'Invalid database identifier')
+        return '"' + value + '"'
+    user, database_name = identifier(a['pg_user']), identifier(a['pg_db'])
+    if not psql('SELECT 1 FROM pg_roles WHERE rolname=' + literal(a['pg_user']) + ';'):
+        psql('CREATE ROLE ' + user + ' LOGIN PASSWORD ' + literal(s['database']) + ';')
+    if not psql('SELECT 1 FROM pg_database WHERE datname=' + literal(a['pg_db']) + ';'):
+        psql('CREATE DATABASE ' + database_name + ' OWNER ' + user + ';')
+    owner = psql('SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname=' + literal(a['pg_db']) + ';')
+    require(owner == a['pg_user'], 'Unexpected application database owner')
+
+
 def database(d):
+    if not is_ha(d['plan']):
+        return single_database(d)
     if not importlib.util.find_spec('psycopg'):
         os.execv('/opt/litellm-patroni/bin/python', ['/opt/litellm-patroni/bin/python', __file__, 'database', str(SECRET_FILE)])
     import psycopg
@@ -247,6 +302,11 @@ def redis_check(d):
     s = d['secrets']
     while time.monotonic() < deadline:
         try:
+            if not is_ha(d['plan']):
+                result = run(common + ['-h', 'localhost', '-p', '6379', 'SET', 'litellm:installer-health', 'ok', 'EX', '30'],
+                    env=dict(os.environ, REDISCLI_AUTH=s['redis']), timeout=10).stdout.strip()
+                require(result == 'OK', 'Local Redis is not writable')
+                return
             answers = []
             for n in d['plan']['nodes']:
                 argv = common + ['-h', n['address'], '-p', '26379', 'SENTINEL']
@@ -264,7 +324,7 @@ def redis_check(d):
             return
         except (RuntimeError, subprocess.SubprocessError):
             time.sleep(3)
-    raise RuntimeError('Redis/Sentinel did not become healthy')
+    raise RuntimeError('Redis' + ('/Sentinel' if is_ha(d['plan']) else '') + ' did not become healthy')
 
 
 def gateway(d):
@@ -313,11 +373,11 @@ def gateway(d):
 def health(d):
     services = []
     if d['plan']['services']['postgresql'] == 'managed':
-        services += ['litellm-postgres', 'litellm-etcd']
+        services += ['litellm-postgres'] + (['litellm-etcd'] if is_ha(d['plan']) else [])
     if d['plan']['services']['redis'] == 'managed':
-        services += ['litellm-redis', 'litellm-sentinel']
+        services += ['litellm-redis'] + (['litellm-sentinel'] if is_ha(d['plan']) else [])
         redis_check(d)
-    if d['plan']['services']['haproxy'] or d['plan']['services']['postgresql'] == 'managed':
+    if d['plan']['services']['haproxy'] or (is_ha(d['plan']) and d['plan']['services']['postgresql'] == 'managed'):
         services += ['litellm-haproxy']
     if d['plan']['services'].get('vip'):
         services += ['keepalived']
@@ -337,7 +397,7 @@ def main():
             'Unsafe node-secret permissions')
     d = json.loads(SECRET_FILE.read_text())
     operations = {'guard': guard, 'claim': claim, 'packages': packages, 'firewall': firewall,
-                  'database': database, 'redis-check': redis_check, 'gateway': gateway, 'check': health}
+                  'init-postgres': init_postgres, 'database': database, 'redis-check': redis_check, 'gateway': gateway, 'check': health}
     require(sys.argv[1] in operations, 'Unknown worker phase')
     try:
         operations[sys.argv[1]](d)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bootstrap three RHEL gateways from node 1. This is not a rolling-upgrade tool."""
+"""Guided RHEL LiteLLM bootstrap: one node or three-node HA. Not a migration tool."""
 import argparse
 from copy import deepcopy
 import getpass
@@ -21,6 +21,14 @@ HERE = Path(__file__).resolve().parent
 ROOT = Path('/var/lib/litellm-cluster')
 OWNER = 'litellm-cluster-v1'
 NAMES = ['idmvllmgwp1', 'idmvllmgwp2', 'idmvllmgwp3']
+
+
+def is_ha(p):
+    return len(p['nodes']) == 3
+
+
+def needs_proxy(p):
+    return p['services']['haproxy'] or (is_ha(p) and p['services']['postgresql'] == 'managed')
 
 
 def same_host(left, right):
@@ -152,13 +160,13 @@ def host(value):
 def validate(p):
     require(p.get('schema') == 1, 'Unsupported plan schema')
     nodes, services, a = p['nodes'], p['services'], p['answers']
-    require(len(nodes) == 3, 'Exactly three nodes are required')
+    require(len(nodes) in (1, 3), 'Choose one node or three-node HA')
     for n in nodes:
         require(host(n['name']), 'Invalid node name')
         require(not ipv4_error(n['address']), 'Use assigned IPv4 node addresses')
         require(re.fullmatch(r'[A-Za-z0-9_.:-]{1,32}', n['interface']), 'Invalid interface')
-    require(len({n['name'].rstrip('.').split('.')[0].casefold() for n in nodes}) == 3
-        and len({n['address'] for n in nodes}) == 3, 'Duplicate nodes (hostname case is ignored)')
+    require(len({n['name'].rstrip('.').split('.')[0].casefold() for n in nodes}) == len(nodes)
+        and len({n['address'] for n in nodes}) == len(nodes), 'Duplicate nodes (hostname case is ignored)')
     for kind in ('postgresql', 'redis'):
         require(services[kind] in ('managed', 'external'), 'Invalid ' + kind + ' choice')
     require(type(services['haproxy']) is bool, 'HAProxy must be a boolean')
@@ -170,25 +178,33 @@ def validate(p):
     for key in ('pg_db', 'pg_user'):
         require(re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]{0,62}', a[key]), 'Invalid database identifier')
     require(a['pg_sslmode'] in ('verify-full', 'verify-ca') and 1 <= a['pg_port'] <= 65535, 'Invalid PostgreSQL TLS/port')
-    require(a['node_count'] == 3 and a['host_port'] == 4000 and a['node_tls'] is True, 'Three TLS backends on port 4000 required')
+    require(a['node_count'] == len(nodes) and a['host_port'] == 4000 and a['node_tls'] is True, 'Node count must match the plan; TLS backends use port 4000')
     require(a['redis_auth'] is True and a['redis_tls'] is True, 'Redis needs password and TLS')
     require(a['redis_topology'] in ('standalone', 'sentinel', 'cluster') and a['redis_nodes'], 'Invalid Redis topology')
     for name, port in a['redis_nodes']:
         require(host(name) and 1 <= port <= 65535, 'Invalid Redis endpoint')
     require(a['redis_topology'] != 'standalone' or len(a['redis_nodes']) == 1, 'Use one standalone endpoint')
     if services['postgresql'] == 'managed':
-        require((a['pg_host'], a['pg_port'], a['pg_sslmode']) == ('localhost', 6432, 'verify-full'), 'Managed PostgreSQL uses localhost:6432 with verified TLS')
+        port = 6432 if is_ha(p) else 5432
+        require((a['pg_host'], a['pg_port'], a['pg_sslmode']) == ('localhost', port, 'verify-full'), 'Managed PostgreSQL uses localhost:' + str(port) + ' with verified TLS')
     if services['redis'] == 'managed':
-        require(a['redis_topology'] == 'sentinel' and a.get('redis_service_name') == 'litellm'
-            and a.get('redis_sentinel_auth') is True and a['redis_nodes'] == [[n['address'], 26379] for n in nodes],
-            'Incorrect managed Sentinel endpoints')
-    require(p['client_cidrs'] and a['lb_cidrs'], 'Client and load-balancer CIDRs required')
+        if is_ha(p):
+            require(a['redis_topology'] == 'sentinel' and a.get('redis_service_name') == 'litellm'
+                and a.get('redis_sentinel_auth') is True and a['redis_nodes'] == [[n['address'], 26379] for n in nodes],
+                'Incorrect managed Sentinel endpoints')
+        else:
+            require(a['redis_topology'] == 'standalone' and a['redis_nodes'] == [['localhost', 6379]]
+                and not a.get('redis_sentinel_auth'), 'Single-node managed Redis uses localhost:6379 without Sentinel')
+    direct = not is_ha(p) and not services['haproxy'] and p.get('frontend') == 'direct'
+    require(p['client_cidrs'] and (a['lb_cidrs'] or direct), 'Client and load-balancer CIDRs required')
+    require(not direct or not a['lb_cidrs'], 'Direct clients must not be trusted as reverse proxies')
     for cidr in p['client_cidrs'] + a['lb_cidrs'] + a['admin_cidrs']:
         parse_cidrs(cidr)
     require(re.fullmatch(r'[A-Za-z_][A-Za-z0-9_-]*', p['ssh_user']), 'Invalid SSH user')
     require(p.get('sudo_mode', 'passwordless') in ('password', 'passwordless'), 'Invalid sudo mode')
     vip = services.get('vip')
     if vip:
+        require(is_ha(p), 'A floating VIP requires the three-node deployment')
         require(services['haproxy'], 'VIP needs managed HAProxy')
         problem = vip_error(vip['address'], nodes)
         require(not problem, problem)
@@ -203,13 +219,17 @@ def wizard(previous=None):
     old_services, old_a = previous.get('services', {}), previous.get('answers', {})
     old_gateway, old_tls = previous.get('gateway', {}), previous.get('tls', {})
     p = {'schema': 1, 'nodes': [], 'services': {}, 'tls': {}}
-    print('Three-node bootstrap: SSH as your login user, then sudo. Password-based sudo is supported.')
+    topology = i.ask_choice('Deployment size', [('single', 'Single node: optional local PostgreSQL/Redis'),
+        ('ha', 'Three-node HA: deploy all nodes from this controller')], 'single' if len(old_nodes) == 1 else 'ha')
+    count = 1 if topology == 'single' else 3
+    print('Single-node bootstrap: all selected services run locally; no automatic failover.' if count == 1 else
+        'Three-node bootstrap: SSH as your login user, then sudo. Password-based sudo is supported.')
     print('Press Enter to accept a detected/default value. Hostname comparisons ignore case.')
     try:
         facts = local_facts()
     except (OSError, ValueError, subprocess.SubprocessError):
         facts = {'hostname': socket.gethostname(), 'interfaces': []}
-    for index, default in enumerate(NAMES):
+    for index, default in enumerate(NAMES[:count]):
         old = old_nodes[index] if index < len(old_nodes) else {}
         default = old.get('name', facts['hostname'].split('.')[0] if index == 0 else default)
         def name_error(value):
@@ -228,6 +248,35 @@ def wizard(previous=None):
         interface = i.ask('Interface on ' + name + ' (auto = detect from its IP)',
             old.get('interface', detected or 'auto'), lambda v: None if re.fullmatch(r'[A-Za-z0-9_.:-]{1,32}', v) else 'Invalid interface name.')
         p['nodes'].append({'name': name, 'address': address, 'interface': interface})
+    p.update(ssh_user='root', identity_file='', sudo_mode='passwordless')
+    if count == 3:
+        ask_ssh(p, previous, i)
+    for kind, description in [('postgresql', 'PostgreSQL 16 + Patroni + etcd quorum' if count == 3 else 'local PostgreSQL 16'),
+            ('redis', 'Redis 7 + Sentinel quorum' if count == 3 else 'local Redis 7')]:
+        p['services'][kind] = i.ask_choice(kind, [('external', 'Use existing ' + kind + ' service'),
+            ('managed', 'Installer-managed ' + description)], old_services.get(kind, 'external' if kind == 'postgresql' and count == 3 else 'managed'))
+    p['services']['haproxy'] = i.ask_yes('Manage HAProxy HTTPS frontend' + (' on all nodes?' if count == 3 else ' on this node?'), old_services.get('haproxy', True))
+    p['services']['vip'] = None
+    if count == 3 and p['services']['haproxy'] and i.ask_yes('Manage a floating VIP with Keepalived?', bool(old_services.get('vip')) if previous else True):
+        old_vip = old_services.get('vip') or {}
+        print('Use a reserved, unused IPv4 address/prefix on the subnet shared by all three nodes.')
+        p['services']['vip'] = {'address': i.ask('Unused VIP address/prefix', old_vip.get('address'), lambda v: vip_error(v, p['nodes'])),
+            'router_id': int(i.ask('Unused VRRP router ID', str(old_vip.get('router_id', 51)), i.v_int(1, 255)))}
+    if count == 1:
+        p['frontend'] = 'single-node' if p['services']['haproxy'] else i.ask_choice('Client access',
+            [('direct', 'Direct HTTPS to LiteLLM on port 4000'), ('external', 'Existing external load balancer')], previous.get('frontend', 'direct'))
+        print('Single-node deployment: point gateway DNS at this host or your selected external load balancer.')
+    elif not p['services']['vip']:
+        p['frontend'] = i.ask_choice('How will clients reach the cluster?',
+            [('external', 'Existing external load balancer'), ('single-node', 'One node for initial testing; client address is not HA')], previous.get('frontend', 'external'))
+        if p['frontend'] == 'single-node':
+            print('Point the gateway DNS at node 1 for testing. Losing node 1 interrupts this client address.')
+        else:
+            print('Point the gateway DNS at your external load balancer, configured for all three nodes.')
+    return wizard_services(p, previous, i)
+
+
+def ask_ssh(p, previous, i):
     p['ssh_user'] = i.ask('SSH login user on nodes 2/3', previous.get('ssh_user', login_user()),
         lambda v: None if re.fullmatch(r'[A-Za-z_][A-Za-z0-9_-]*', v) else 'Invalid login user.')
     p['identity_file'] = i.ask('SSH private key path (missing key can be created; type agent to use SSH agent)',
@@ -240,23 +289,11 @@ def wizard(previous=None):
         [('password', 'Prompt securely for the shared sudo password'), ('passwordless', 'Passwordless sudo')], previous.get('sudo_mode', 'password'))
     if p['sudo_mode'] == 'password':
         print('Ansible will prompt once. Both remote nodes must accept that sudo password. It is not saved in the plan.')
-    for kind, description in [('postgresql', 'PostgreSQL 16 + Patroni + etcd quorum'), ('redis', 'Redis 7 + Sentinel quorum')]:
-        p['services'][kind] = i.ask_choice(kind, [('external', 'Use existing HA service'),
-            ('managed', 'Installer-managed ' + description)], old_services.get(kind, 'external' if kind == 'postgresql' else 'managed'))
-    p['services']['haproxy'] = i.ask_yes('Manage HAProxy HTTPS frontend on all nodes?', old_services.get('haproxy', True))
-    p['services']['vip'] = None
-    if p['services']['haproxy'] and i.ask_yes('Manage a floating VIP with Keepalived?', bool(old_services.get('vip')) if previous else True):
-        old_vip = old_services.get('vip') or {}
-        print('Use a reserved, unused IPv4 address/prefix on the subnet shared by all three nodes.')
-        p['services']['vip'] = {'address': i.ask('Unused VIP address/prefix', old_vip.get('address'), lambda v: vip_error(v, p['nodes'])),
-            'router_id': int(i.ask('Unused VRRP router ID', str(old_vip.get('router_id', 51)), i.v_int(1, 255)))}
-    if not p['services']['vip']:
-        p['frontend'] = i.ask_choice('How will clients reach the cluster?',
-            [('external', 'Existing external load balancer'), ('single-node', 'One node for initial testing; client address is not HA')], previous.get('frontend', 'external'))
-        if p['frontend'] == 'single-node':
-            print('Point the gateway DNS at node 1 for testing. Losing node 1 interrupts this client address.')
-        else:
-            print('Point the gateway DNS at your external load balancer, configured for all three nodes.')
+
+
+def wizard_services(p, previous, i):
+    old_services, old_a = previous.get('services', {}), previous.get('answers', {})
+    old_gateway, old_tls = previous.get('gateway', {}), previous.get('tls', {})
     p['gateway'] = {'mode': i.ask_choice('LiteLLM runtime', [('container', 'Rootless Podman'), ('native', 'Python 3.12 + systemd')], old_gateway.get('mode', 'container')),
         'version': i.ask('Exact LiteLLM release', old_gateway.get('version', 'v1.106.2'),
             lambda v: None if re.fullmatch(r'v\d+\.\d+\.\d+', v) and v != 'v1.107.0' else 'Enter an exact supported tag, such as v1.106.2.'),
@@ -266,22 +303,27 @@ def wizard(previous=None):
     if not client_default and ssh_client and not ipv4_error(ssh_client[0]):
         client_default = ssh_client[0] + '/32'
     print('Client access: enter real client IPs (/32) or network CIDRs, separated by commas. 0.0.0.0/24 does NOT mean all clients.')
-    p['client_cidrs'] = ask_cidrs('Client IPs/CIDRs allowed to reach ' + ('HAProxy' if p['services']['haproxy'] else 'your external load balancer'), client_default)
+    p['client_cidrs'] = ask_cidrs('Allowed client IPs/CIDRs', client_default)
     a = {'fqdn': i.ask('Gateway DNS name', old_a.get('fqdn'), i.v_host), 'host_port': 4000, 'workers': p['gateway']['workers'],
-        'node_count': 3, 'node_tls': True, 'lb_cidrs': [n['address'] + '/32' for n in p['nodes']], 'admin_cidrs': [],
+        'node_count': len(p['nodes']), 'node_tls': True, 'lb_cidrs': [n['address'] + '/32' for n in p['nodes']], 'admin_cidrs': [],
         'retention': i.ask('Log retention', old_a.get('retention', '90d'), i.v_retention), 'pg_db': 'litellm', 'pg_user': 'litellm',
         'pg_bouncer_tx': False, 'redis_username': '', 'redis_auth': True, 'redis_tls': True, 'model_urls': []}
-    if not p['services']['haproxy']:
+    if p.get('frontend') == 'direct':
+        a['lb_cidrs'] = []
+    elif not p['services']['haproxy']:
         a['lb_cidrs'] = ask_cidrs('External load-balancer source CIDRs', ','.join(old_a.get('lb_cidrs', [])) or None)
     if p['services']['postgresql'] == 'managed':
-        a.update(pg_host='localhost', pg_port=6432, pg_sslmode='verify-full')
+        a.update(pg_host='localhost', pg_port=6432 if is_ha(p) else 5432, pg_sslmode='verify-full')
     else:
         a.update(pg_host=i.ask('Existing writable PostgreSQL endpoint', old_a.get('pg_host') if old_services.get('postgresql') == 'external' else None, i.v_host),
             pg_port=int(i.ask('PostgreSQL port', str(old_a.get('pg_port', 5432)) if old_services.get('postgresql') == 'external' else '5432', i.v_int(1, 65535))),
             pg_db=i.ask('Database', old_a.get('pg_db', 'litellm'), i.v_ident), pg_user=i.ask('Database owner', old_a.get('pg_user', 'litellm'), i.v_ident), pg_sslmode='verify-full')
         a['pg_bouncer_tx'] = i.ask_yes('PgBouncer transaction pooling?', old_a.get('pg_bouncer_tx', False))
     if p['services']['redis'] == 'managed':
-        a.update(redis_topology='sentinel', redis_nodes=[[n['address'], 26379] for n in p['nodes']], redis_service_name='litellm', redis_sentinel_auth=True)
+        if is_ha(p):
+            a.update(redis_topology='sentinel', redis_nodes=[[n['address'], 26379] for n in p['nodes']], redis_service_name='litellm', redis_sentinel_auth=True)
+        else:
+            a.update(redis_topology='standalone', redis_nodes=[['localhost', 6379]], redis_service_name='', redis_sentinel_auth=False)
     else:
         a['redis_topology'] = i.ask_choice('Existing Redis topology', [('standalone', 'Single endpoint'), ('sentinel', 'Sentinel'), ('cluster', 'Redis Cluster')],
             old_a.get('redis_topology', 'sentinel'))
@@ -401,7 +443,8 @@ def redis_quote(v):
 
 def redis_config(p, n, s, sentinel=False):
     b = '/etc/litellm-cluster/redis'
-    lines = ['bind 127.0.0.1 ' + n['address'], 'protected-mode yes', 'port 0', 'tls-port ' + ('26379' if sentinel else '6379'),
+    require(not sentinel or is_ha(p), 'Sentinel is only used by the three-node deployment')
+    lines = ['bind 127.0.0.1' + (' ' + n['address'] if is_ha(p) else ''), 'protected-mode yes', 'port 0', 'tls-port ' + ('26379' if sentinel else '6379'),
         'tls-cert-file ' + b + '/node.crt', 'tls-key-file ' + b + '/node.key', 'tls-ca-cert-file ' + b + '/ca.crt',
         'tls-auth-clients no', 'tls-replication yes', 'daemonize no', 'logfile ""', 'dir /var/lib/litellm-redis',
         'requirepass ' + redis_quote(s['sentinel'] if sentinel else s['redis'])]
@@ -409,19 +452,31 @@ def redis_config(p, n, s, sentinel=False):
         lines += ['sentinel monitor litellm ' + p['nodes'][0]['address'] + ' 6379 2', 'sentinel auth-pass litellm ' + redis_quote(s['redis']),
             'sentinel down-after-milliseconds litellm 10000', 'sentinel failover-timeout litellm 60000', 'sentinel parallel-syncs litellm 1',
             'sentinel announce-ip ' + n['address'], 'sentinel announce-port 26379']
-    else:
+    elif is_ha(p):
         lines += ['appendonly yes', 'masterauth ' + redis_quote(s['redis']), 'replica-announce-ip ' + n['address'],
             'replica-announce-port 6379', 'min-replicas-to-write 1', 'min-replicas-max-lag 10']
         if n['name'] != p['nodes'][0]['name']:
             lines.append('replicaof ' + p['nodes'][0]['address'] + ' 6379')
+    else:
+        lines += ['appendonly yes', 'min-replicas-to-write 0']
     return '\n'.join(lines) + '\n'
+
+
+def single_postgres_config(p):
+    b = '/etc/litellm-cluster/postgres'
+    config = "\n".join(["data_directory = '/var/lib/pgsql/data'", "listen_addresses = '127.0.0.1'", 'port = 5432',
+        "unix_socket_directories = '/var/run/postgresql'", "hba_file = '" + b + "/pg_hba.conf'", "ssl = on",
+        "ssl_cert_file = '" + b + "/node.crt'", "ssl_key_file = '" + b + "/node.key'", "ssl_ca_file = '" + b + "/ca.crt'",
+        "password_encryption = 'scram-sha-256'", 'synchronous_standby_names = \'\'']) + '\n'
+    hba = 'local all postgres peer\nhostssl ' + p['answers']['pg_db'] + ' ' + p['answers']['pg_user'] + ' 127.0.0.1/32 scram-sha-256\n'
+    return config, hba
 
 
 def haproxy_config(p):
     b = '/etc/haproxy/litellm'
     lines = ['global', '  log stdout format raw local0', '  user haproxy', '  group haproxy', '  maxconn 8192',
         'defaults', '  log global', '  timeout connect 10s', '  timeout client 660s', '  timeout server 660s']
-    if p['services']['postgresql'] == 'managed':
+    if is_ha(p) and p['services']['postgresql'] == 'managed':
         lines += ['listen postgres_primary', '  bind 127.0.0.1:6432', '  mode tcp', '  option httpchk GET /primary',
             '  http-check expect status 200', '  default-server inter 2s fall 3 rise 2 on-marked-down shutdown-sessions']
         for n in p['nodes']:
@@ -463,15 +518,23 @@ def stage(p, s, work, bundle):
         save(d / 'node.json', {'owner': OWNER, 'plan_id': plan_id(p), 'plan': p, 'node': n, 'secrets': s, 'bundle_sha256': checksum})
         files = {}
         if p['services']['postgresql'] == 'managed':
-            files['etcd.json'], files['postgres.json'] = json.dumps(etcd_config(p, n), indent=2), json.dumps(patroni_config(p, n, s), indent=2)
-            files['litellm-etcd.service'] = unit('LiteLLM etcd', 'litellm-etcd', '/usr/local/libexec/litellm-etcd --config-file /etc/litellm-cluster/etcd/etcd.json', '/var/lib/litellm-etcd')
-            files['litellm-postgres.service'] = unit('LiteLLM PostgreSQL/Patroni', 'postgres', '/opt/litellm-patroni/bin/patroni /etc/litellm-cluster/postgres/postgres.json', '/var/lib/pgsql /var/run/postgresql')
+            if is_ha(p):
+                files['etcd.json'], files['postgres.json'] = json.dumps(etcd_config(p, n), indent=2), json.dumps(patroni_config(p, n, s), indent=2)
+                files['litellm-etcd.service'] = unit('LiteLLM etcd', 'litellm-etcd', '/usr/local/libexec/litellm-etcd --config-file /etc/litellm-cluster/etcd/etcd.json', '/var/lib/litellm-etcd')
+                files['litellm-postgres.service'] = unit('LiteLLM PostgreSQL/Patroni', 'postgres', '/opt/litellm-patroni/bin/patroni /etc/litellm-cluster/postgres/postgres.json', '/var/lib/pgsql /var/run/postgresql')
+            else:
+                files['postgresql.conf'], files['pg_hba.conf'] = single_postgres_config(p)
+                files['litellm-postgres.service'] = unit('LiteLLM local PostgreSQL', 'postgres',
+                    '/usr/bin/postgres -D /var/lib/pgsql/data -c config_file=/etc/litellm-cluster/postgres/postgresql.conf',
+                    '/var/lib/pgsql /var/run/postgresql').replace('[Service]\n', '[Service]\nRuntimeDirectory=postgresql\nRuntimeDirectoryMode=0755\n')
         if p['services']['redis'] == 'managed':
-            files['redis.conf'], files['sentinel.conf'] = redis_config(p, n, s), redis_config(p, n, s, True)
-            for role in ('redis', 'sentinel'):
+            files['redis.conf'] = redis_config(p, n, s)
+            if is_ha(p):
+                files['sentinel.conf'] = redis_config(p, n, s, True)
+            for role in (('redis', 'sentinel') if is_ha(p) else ('redis',)):
                 files['litellm-' + role + '.service'] = unit('LiteLLM Redis ' + role, 'redis', '/usr/bin/redis-server /etc/litellm-cluster/redis/' + role + '.conf'
                     + (' --sentinel' if role == 'sentinel' else ''), '/var/lib/litellm-redis /etc/litellm-cluster/redis')
-        if p['services']['haproxy'] or p['services']['postgresql'] == 'managed':
+        if needs_proxy(p):
             files['haproxy.cfg'] = haproxy_config(p)
             files['litellm-haproxy.service'] = ('[Unit]\nDescription=LiteLLM HAProxy\nAfter=network-online.target\nWants=network-online.target\n'
                 '[Service]\nType=notify\nExecStart=/usr/sbin/haproxy -Ws -f /etc/haproxy/litellm-cluster.cfg -p /run/litellm-haproxy.pid\n'
@@ -521,9 +584,11 @@ def inventory(p):
     return {'all': {'children': {'gateways': {'hosts': hosts}}}}
 
 
-def ensure_tools():
+def ensure_tools(p):
     import install as i
-    required = {'ansible-playbook': 'ansible-core', 'openssl': 'openssl', 'ssh': 'openssh-clients', 'ssh-copy-id': 'openssh-clients'}
+    required = {'ansible-playbook': 'ansible-core', 'openssl': 'openssl'}
+    if is_ha(p):
+        required.update(ssh='openssh-clients', **{'ssh-copy-id': 'openssh-clients'})
     packages = sorted({package for command, package in required.items() if not shutil.which(command)})
     if packages:
         require(interactive() and shutil.which('dnf'), 'Install controller prerequisites: ' + ' '.join(packages))
@@ -541,6 +606,8 @@ def ssh_command(p, node, batch=True):
 
 
 def prepare_ssh(p):
+    if not is_ha(p):
+        return
     import install as i
     key = Path(p['identity_file']) if p.get('identity_file') else None
     if key and not key.is_file():
@@ -660,7 +727,9 @@ def select_plan(config=None):
 
 
 def summary(p):
-    print(json.dumps({'nodes': p['nodes'], 'ssh_user': p['ssh_user'], 'sudo': p.get('sudo_mode', 'legacy; selected at apply'),
+    print(json.dumps({'deployment': 'three-node HA' if is_ha(p) else 'single node; no automatic failover',
+        'nodes': p['nodes'], 'ssh_user': p['ssh_user'] if is_ha(p) else 'not used (local connection)',
+        'sudo': p.get('sudo_mode', 'legacy; selected at apply') if is_ha(p) else 'controller already runs as root via sudo',
         'gateway': p['gateway'], 'services': p['services'], 'client_cidrs': p['client_cidrs'],
         'gateway_dns': p['answers']['fqdn'], 'frontend': 'VIP' if p['services'].get('vip') else p.get('frontend', 'external load balancer required'),
         'SELinux': 'haproxy_connect_any enabled when a local proxy is selected',
@@ -670,18 +739,19 @@ def summary(p):
 def playbook_command(p, work):
     argv = ['ansible-playbook', '-i', str(work / 'inventory.json'), str(work / 'playbook.json')]
     sudo_mode = p.get('sudo_mode')
-    if sudo_mode is None and p['ssh_user'] != 'root' and interactive():
+    if is_ha(p) and sudo_mode is None and p['ssh_user'] != 'root' and interactive():
         import install as i
         sudo_mode = i.ask_choice('Sudo on nodes 2/3', [('password', 'Prompt for shared sudo password'),
             ('passwordless', 'Passwordless sudo')], 'password')
-    if sudo_mode == 'password' and p['ssh_user'] != 'root':
+    if is_ha(p) and sudo_mode == 'password' and p['ssh_user'] != 'root':
         argv.append('--ask-become-pass')
     return argv
 
 
 def playbook(p, work, bundle, infrastructure):
     pg, redis = p['services']['postgresql'] == 'managed', p['services']['redis'] == 'managed'
-    proxy, vip = pg or p['services']['haproxy'], p['services'].get('vip')
+    ha = is_ha(p)
+    proxy, vip = needs_proxy(p), p['services'].get('vip')
     remote, src = '/var/lib/litellm-cluster', str(work) + '/{{ inventory_hostname }}/'
     def worker(phase, **kw):
         return task(phase, 'command', {'argv': ['python3', remote + '/cluster_node.py', phase, remote + '/node.json']}, no_log=True, **kw)
@@ -691,7 +761,7 @@ def playbook(p, work, bundle, infrastructure):
             "import json,pathlib,sys; p=pathlib.Path('/var/lib/litellm-cluster/ownership.json'); d=json.loads(p.read_text()) if p.exists() else {}; sys.exit(0 if not d or (d.get('owner')==sys.argv[1] and d.get('plan_id')==sys.argv[2]) else 1)", OWNER, plan_id(p)]}, changed_when=False),
         copy(HERE / 'cluster_node.py', remote + '/cluster_node.py'), copy(HERE / 'install.py', remote + '/install.py'), copy(src + 'node.json', remote + '/node.json'),
         worker('guard', changed_when=False), worker('claim')]
-    result = [play('Preflight all three hosts', pre)]
+    result = [play('Preflight all three hosts' if ha else 'Preflight local host', pre)]
     packages = ['python3.12', 'python3.12-pip', 'openssl', 'curl', 'firewalld', 'chrony', 'policycoreutils-python-utils']
     packages += ['podman', 'passt', 'container-selinux'] if p['gateway']['mode'] == 'container' else ['nodejs']
     packages += ['haproxy'] if proxy else []
@@ -702,7 +772,7 @@ def playbook(p, work, bundle, infrastructure):
             setup += [task('Install ' + stream + ' without resetting existing streams', 'command', {'argv': ['dnf', '-y', 'module', 'install', stream], 'creates': executable}),
                 task('Verify ' + stream, 'command', {'argv': [executable, '--version']}, register='package_version', changed_when=False,
                     failed_when=repr(version) + ' not in package_version.stdout')]
-    if pg:
+    if pg and ha:
         setup += [task('Create etcd account', 'user', {'name': 'litellm-etcd', 'system': True, 'create_home': False, 'shell': '/sbin/nologin'}),
             task('Stage offline infrastructure', 'copy', {'src': str(infrastructure) + '/', 'dest': remote + '/infrastructure/', 'mode': 'preserve'}), worker('packages')]
     if proxy:
@@ -710,14 +780,18 @@ def playbook(p, work, bundle, infrastructure):
     result += [play('Install selected prerequisites', setup)]
     config = [directory('/etc/litellm-cluster', mode='0755'), copy(bundle, remote + '/application.tar'),
         copy(src + 'ca.crt', remote + '/ca.crt', mode='0644'), copy(src + 'node.crt', remote + '/node.crt', mode='0644'), copy(src + 'node.key', remote + '/node.key')]
-    roles = [('etcd', 'litellm-etcd', '/var/lib/litellm-etcd'), ('postgres', 'postgres', '/var/lib/pgsql/data')] if pg else []
+    roles = [('postgres', 'postgres', '/var/lib/pgsql/data')] if pg else []
+    if pg and ha:
+        roles.insert(0, ('etcd', 'litellm-etcd', '/var/lib/litellm-etcd'))
     if redis:
         roles += [('redis', 'redis', '/var/lib/litellm-redis')]
     for role, owner, data in roles:
         config += [directory(data, owner), directory('/etc/litellm-cluster/' + role, owner)]
-        for name in ['ca.crt', 'node.crt', 'node.key'] + (['redis.conf', 'sentinel.conf'] if role == 'redis' else [role + '.json']):
+        settings = ['redis.conf'] + (['sentinel.conf'] if ha else []) if role == 'redis' else (
+            ['postgresql.conf', 'pg_hba.conf'] if role == 'postgres' and not ha else [role + '.json'])
+        for name in ['ca.crt', 'node.crt', 'node.key'] + settings:
             config += [copy(src + name, '/etc/litellm-cluster/' + role + '/' + name, owner, force=name not in ('redis.conf', 'sentinel.conf'))]
-        for sr in (['redis', 'sentinel'] if role == 'redis' else [role]):
+        for sr in (['redis', 'sentinel'] if role == 'redis' and ha else [role]):
             config += [copy(src + 'litellm-' + sr + '.service', '/etc/systemd/system/litellm-' + sr + '.service', mode='0644')]
     if pg:
         config += [directory('/var/run/postgresql', 'postgres', '0755')]
@@ -727,14 +801,21 @@ def playbook(p, work, bundle, infrastructure):
         config += [copy(src + 'haproxy.cfg', '/etc/haproxy/litellm-cluster.cfg', mode='0644'), copy(src + 'litellm-haproxy.service', '/etc/systemd/system/litellm-haproxy.service', mode='0644')]
     config += [worker('firewall')]
     result += [play('Stage services and scoped firewall rules', config)]
-    if pg:
+    if pg and ha:
         result += [play('Form etcd quorum', [service('litellm-etcd'), task('Wait for etcd quorum', 'command', {'argv': [
             '/usr/local/libexec/litellm-etcdctl', '--endpoints=https://{{ node_address }}:2379', '--cacert=/etc/litellm-cluster/etcd/ca.crt',
             '--cert=/etc/litellm-cluster/etcd/node.crt', '--key=/etc/litellm-cluster/etcd/node.key', 'endpoint', 'health']},
             register='etcd_health', retries=30, delay=2, until='etcd_health.rc == 0', changed_when=False)]),
             play('Form Patroni primary and replicas', [service('litellm-postgres'), worker('database', run_once=True)])]
+    elif pg:
+        result += [play('Initialize local PostgreSQL', [worker('init-postgres'), service('litellm-postgres'),
+            worker('database', run_once=True)])]
     if redis:
-        result += [play('Start Redis replicas', [service('litellm-redis')]), play('Form Sentinel quorum', [service('litellm-sentinel'), worker('redis-check', run_once=True)])]
+        result += [play('Start Redis replicas' if ha else 'Start local Redis', [service('litellm-redis')])]
+        if ha:
+            result += [play('Form Sentinel quorum', [service('litellm-sentinel'), worker('redis-check', run_once=True)])]
+        else:
+            result += [play('Verify local Redis', [worker('redis-check')])]
     if proxy:
         result += [play('Start primary routing and optional HTTPS balancing', [task('Validate HAProxy', 'command', {'argv': ['haproxy', '-c', '-f', '/etc/haproxy/litellm-cluster.cfg']}, changed_when=False), service('litellm-haproxy')])]
     result += [play('Install and health-check gateways sequentially', [worker('gateway')], serial=1)]
@@ -781,12 +862,12 @@ def main(argv=None):
             summary(p)
             print('Draft saved to ' + str(saved) + '; auto interfaces will be detected at apply. Remote nodes unchanged.')
             return 0
-        ensure_tools()
+        ensure_tools(p)
         bundle = choose_bundle(args.bundle)
         infra = args.infrastructure.resolve() if args.infrastructure else HERE / 'infrastructure'
         while True:
             verify_bundle_plan(p, bundle)
-            if p['services']['postgresql'] == 'managed':
+            if is_ha(p) and p['services']['postgresql'] == 'managed':
                 from cluster_node import verify_infrastructure
                 verify_infrastructure(infra)
             prepare_ssh(p)
@@ -796,7 +877,7 @@ def main(argv=None):
             summary(p)
             if args.yes:
                 break
-            choices = [('apply', 'Apply this plan to ALL THREE nodes')]
+            choices = [('apply', 'Apply this plan to ' + ('ALL THREE nodes' if is_ha(p) else 'THIS node only'))]
             if not locked:
                 choices.append(('edit', 'Edit answers before provisioning'))
             choices.append(('exit', 'Save and exit'))
@@ -827,7 +908,8 @@ def main(argv=None):
             env['ANSIBLE_BECOME_ASK_PASS'] = 'False'
         r = subprocess.run(playbook_command(p, work), env=env)
         require(r.returncode == 0, 'Deployment failed. Fix the failed phase and rerun; choose Resume saved plan. Keep the SAME bundle and secrets.')
-        print('All selected services passed health checks. Gateway: https://' + p['answers']['fqdn'] + '/ui')
+        port = ':4000' if p.get('frontend') == 'direct' else ''
+        print('All selected services passed health checks. Gateway: https://' + p['answers']['fqdn'] + port + '/ui')
         return 0
     except KeyboardInterrupt:
         print('\nCoordinator cancelled. Remote actions already started may finish. Rerun to resume the saved plan.', file=sys.stderr)

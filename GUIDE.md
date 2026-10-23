@@ -1,10 +1,16 @@
 # LiteLLM RHEL installer
 
-For a three-node deployment from idmvllmgwp1, see [CLUSTER.md](CLUSTER.md).
-Cluster mode offers external or installer-managed PostgreSQL and Redis, optional
-HAProxy and Keepalived, and both LiteLLM runtime modes.
+For guided single-node or three-node deployment, run:
 
-For one gateway, verify and extract the bundle, then run:
+    sudo python3.12 install.py setup
+
+Choose 1 for single node or 2 for three-node HA. See [CLUSTER.md](CLUSTER.md).
+Both offer external or installer-managed PostgreSQL and Redis, optional HAProxy,
+and both LiteLLM runtime modes. Single-node mode uses local standalone services
+and does not configure SSH, Sentinel, Patroni, etcd or Keepalived.
+
+For the legacy gateway-only installer with existing external services, verify
+and extract the bundle, then run:
 
     python3 install.py parts --verify
     sudo python3 install.py install

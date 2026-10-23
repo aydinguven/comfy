@@ -1,4 +1,36 @@
-# Three-node HA installation
+# Guided single-node or three-node installation
+
+Installer **2026-10-23.1** starts with a deployment-size choice. Run:
+
+    sudo python3.12 install.py setup
+
+`install.py cluster` remains an alias for the same wizard.
+
+## Single node
+
+Choose **1 — Single node** to install only on the current host. SSH keys,
+remote sudo, nodes 2/3, VIP and Keepalived are not requested or configured.
+The wizard still offers native Python/systemd or rootless Podman and a choice
+of managed or external PostgreSQL and Redis.
+
+Managed PostgreSQL 16 runs locally on `127.0.0.1:5432`, with TLS, SCRAM,
+an application-owned database, local peer authentication for administration,
+and no Patroni/etcd or synchronous-standby requirement. Managed Redis 7 is a
+local TLS/password service on `127.0.0.1:6379` with AOF and no Sentinel or
+replica-write requirement. Database/cache ports are not opened to the network.
+Single-node managed services use RHEL RPMs and do not need the Patroni/etcd
+offline payload.
+
+Optional HAProxy provides HTTPS on port 443. Without it, choose direct HTTPS
+to LiteLLM on port 4000 or your existing external load balancer. Direct mode
+allows the selected client CIDRs and does not trust clients as reverse proxies.
+Point gateway DNS at the selected host or external load balancer.
+
+This is a standalone deployment: a host failure stops the gateway and its local
+services. Existing claimed deployments cannot be converted between one and
+three nodes by changing a saved plan; that requires an explicit migration.
+
+## Three-node HA
 
 Run the coordinator on **idmvllmgwp1**. Default hosts are idmvllmgwp1,
 idmvllmgwp2 and idmvllmgwp3. The wizard requests actual IPv4 addresses, network
@@ -41,8 +73,9 @@ Resolved versions/hashes are frozen into the offline payload; pip requires those
 hashes during installation. Use --infrastructure to reuse a verified directory.
 
 --without-managed-postgresql omits the Patroni/etcd payload, while retaining the
-external PostgreSQL, Redis, HAProxy and VIP options. Managed PostgreSQL cannot
-be selected at deployment without its offline payload.
+external PostgreSQL, single-node local PostgreSQL, Redis, HAProxy and VIP
+options. Three-node managed PostgreSQL cannot be selected without its offline
+Patroni/etcd payload.
 
 **RHEL RPMs are not embedded.** Nodes require entitled BaseOS/AppStream or
 Satellite repositories/local mirrors. The controller requires ansible-core and

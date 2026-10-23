@@ -51,7 +51,7 @@ import zlib
 from pathlib import Path
 from string import Template
 
-INSTALLER_VERSION = "2026-10-22.6"
+INSTALLER_VERSION = "2026-10-23.1"
 HERE = Path(__file__).resolve().parent
 STAGING = Path("/var/tmp/litellm-installer-parts")       # parts extracted from tars, removed after each run
 SRV = Path("/srv/litellm")
@@ -3024,6 +3024,7 @@ def cmd_cluster(args):
 
 COMMANDS = {
     "cluster": cmd_cluster,
+    "setup": cmd_cluster,
     "install": cmd_install,
     "upgrade": cmd_upgrade,
     "rollback": cmd_rollback,
@@ -3037,7 +3038,7 @@ COMMANDS = {
 def menu():
     say(_paint("1", "LiteLLM HA gateway installer") + f" {INSTALLER_VERSION}  ({HERE / 'install.py'})")
     return ask_choice("What do you want to do?", [
-        ("cluster", "Deploy a three-node HA cluster from this controller"),
+        ("setup", "Guided setup: single node or three-node HA"),
         ("install", "Install or reconfigure this node (container or native)"),
         ("download", "Download the parts from the internet, then install (no bundle needed)"),
         ("upgrade", "Upgrade this node to a release found in the parts"),
@@ -3047,11 +3048,11 @@ def menu():
         ("rollback", "Roll back to the previous version"),
         ("uninstall", "Remove the gateway from this node"),
         ("quit", "Quit"),
-    ], "install")
+    ], "setup")
 
 
 def main():
-    if len(sys.argv) > 1 and sys.argv[1] == "cluster":
+    if len(sys.argv) > 1 and sys.argv[1] in ("cluster", "setup"):
         import cluster
         return cluster.main(sys.argv[2:])
     parser = argparse.ArgumentParser(description="Offline installer for the LiteLLM HA gateway")
