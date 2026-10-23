@@ -1,3 +1,68 @@
+NEXT STEP: READ-ONLY SSH / NODE CHECKS
+
+Node 1 is healthy. Target: three LiteLLM gateways, PostgreSQL and Redis on node 1.
+Run the block below on node 1. It logs into nodes 2/3 as tcmb and checks whether
+noninteractive sudo is available. Password-based sudo can be handled separately.
+No packages, firewall rules, services, database data, or saved plans are changed.
+Use an existing SSH key; this check does not create keys or accept new host keys.
+If a host key is unknown, verify its fingerprint against that node's console first.
+
+COPY FROM HERE:
+
+sudo bash <<'BASH'
+umask 077
+ssh_key=''
+if [ -r /root/.ssh/litellm_cluster ]; then
+    ssh_key=/root/.ssh/litellm_cluster
+fi
+printf 'Existing SSH private key path [%s] (blank default uses agent/default keys): ' "$ssh_key"
+IFS= read -r answer < /dev/tty || exit 1
+ssh_key=${answer:-$ssh_key}
+ssh_args=()
+if [ -n "$ssh_key" ]; then
+    if [ ! -r "$ssh_key" ]; then
+        printf 'Key is not readable: %s\n' "$ssh_key"
+        exit 1
+    fi
+    ssh_args=(-i "$ssh_key")
+fi
+for node in idmvllmgwp2 idmvllmgwp3; do
+    printf '\nNODE %s\n' "$node"
+    if ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=10 \
+        "${ssh_args[@]}" "tcmb@$node" bash -s <<'REMOTE'
+hostname -s
+cat /etc/redhat-release
+id -un
+if sudo -n true >/dev/null 2>&1; then
+    printf 'SUDO=NONINTERACTIVE_OK\n'
+else
+    printf 'SUDO=PASSWORD_REQUIRED_OR_NOT_AUTHORIZED\n'
+fi
+ip -4 route get 10.255.15.119
+ip -brief -4 address
+getenforce
+rpm -q python3.12 podman openssl
+printf 'Current listening ports (443, 4000, 5432, 6379):\n'
+ss -H -ltn '( sport = :443 or sport = :4000 or sport = :5432 or sport = :6379 )'
+REMOTE
+    then
+        printf 'SSH_CHECK=COMPLETE\n'
+    else
+        printf 'SSH_CHECK=FAILED for %s\n' "$node"
+    fi
+done
+BASH
+
+END COPY.
+
+Append the output below and commit this file. Do not paste passwords or keys.
+Do not change the saved single-node plan or select a fresh three-node install yet.
+
+NEXT CHECK OUTPUT:
+(paste here)
+
+PREVIOUS OUTPUT (kept for reference):
+
 [root@IDMVLLMGWP1 ~]# python3.12 /home/tcmb/migration-precheck.py 
 {
   "nodes": [
