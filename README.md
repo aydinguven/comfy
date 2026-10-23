@@ -29,6 +29,12 @@ Run source tests with `python3 -m unittest -v test_cluster`.
 See [CHANGELOG.md](CHANGELOG.md) for the RHEL bootstrap fixes. Run all regressions
 with `python3 -m unittest -v test_cluster test_pki test_reset test_setup`.
 
+For a working single-node deployment that will be expanded later, start with
+`sudo python3.12 migration-precheck.py` from
+[migration-precheck.py](migration-precheck.py). It reports public settings and
+local service/readiness status without changing the deployment. See
+[UPDATE.md](UPDATE.md) before planning any migration.
+
 If gateway checks fail with **CA cert does not include key usage extension**,
 run [repair-litellm-ca.sh](repair-litellm-ca.sh) on the controller, then resume
 the same saved plan. See [RUNBOOK.md](RUNBOOK.md) for the backup and validation

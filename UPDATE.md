@@ -27,3 +27,17 @@ to use its UI; perform live application/infrastructure upgrades separately.
 Changing an existing one-node plan into three gateways is an explicit migration,
 not a Resume operation. Preserve database contents, keys and CA until that
 migration has been planned and verified.
+
+Before planning that migration, download the standalone
+[migration-precheck.py](migration-precheck.py) from the repository and run it on
+the existing node 1:
+
+    sudo python3.12 migration-precheck.py
+
+It reports selected public deployment fields, runtime-aware gateway/infrastructure
+service status and a local HTTPS readiness check with CA verification. It does
+not read secrets.json, print journals/response bodies, create backups, modify
+configuration or contact nodes 2/3. Use `--plan-only` to skip service/HTTPS checks.
+The report is the first diagnostic step, not a migration procedure or an approval
+to modify the saved plan. The helper is standalone; existing v4 release archives
+are unchanged. Tests: `python3 -m unittest -v test_migration_precheck`.
