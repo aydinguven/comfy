@@ -8,6 +8,33 @@ litellm-haproxy; they have no automatic failover. Resume with the same plan and
 bundle. Switching an existing deployment between one and three nodes is a
 migration, not a bootstrap retry.
 
+If a gateway dependency probe reports `CA cert does not include key usage
+extension`, repair the original controller CA with
+[repair-litellm-ca.sh](repair-litellm-ca.sh):
+
+    sudo bash repair-litellm-ca.sh --dry-run
+    sudo bash repair-litellm-ca.sh
+    sudo python3.12 install.py setup
+
+Choose **Resume saved plan** and retain the same bundle and secrets. The helper
+preserves the CA private key, subject and serial, and all existing node
+certificates. It archives the original CA certificate in a root-only
+`/var/lib/litellm-cluster/work/ca/repair.XXXXXXXX` directory. Before atomically
+replacing the controller CA certificate it checks all discovered staged and
+local PostgreSQL/Redis node certificates with `openssl verify -x509_strict`
+for both TLS server and client use. A validation failure leaves the original
+CA certificate in place. A valid deployment is left unchanged. Dry run does
+not write files. Run only on the controller, with no installer/CA changes in
+progress; the repair lock serializes repair helpers, not installer runs.
+
+Resume restages the repaired CA onto every node in the saved plan and updates
+the gateway trust bundle. The helper itself does not contact nodes or restart
+services. For an existing live deployment, use a separate maintenance plan;
+this procedure targets the failed bootstrap. It is not CA/key rotation or
+certificate renewal. Source certificate generation includes the required
+extensions; previously published release bundles are unchanged by this source
+fix. Run PKI/repair regression tests with `python3 -m unittest -v test_pki`.
+
 For a deliberate fresh start on one host, use [reset-litellm.sh](reset-litellm.sh):
 
     sudo bash reset-litellm.sh --dry-run

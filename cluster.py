@@ -370,6 +370,9 @@ def pki(p, work):
     if not (ca / 'ca.crt').exists():
         require(not any((work / n['name'] / 'node.crt').exists() for n in p['nodes']), 'Recover the original controller CA')
         run(['openssl', 'req', '-x509', '-newkey', 'rsa:3072', '-nodes', '-days', '3650', '-subj', '/CN=LiteLLM cluster CA',
+            '-addext', 'basicConstraints=critical,CA:TRUE',
+            '-addext', 'keyUsage=critical,keyCertSign,cRLSign',
+            '-addext', 'subjectKeyIdentifier=hash', '-addext', 'authorityKeyIdentifier=keyid:always',
             '-keyout', str(ca / 'ca.key'), '-out', str(ca / 'ca.crt')])
     run(['openssl', 'x509', '-in', str(ca / 'ca.crt'), '-checkend', '604800', '-noout'])
     for n in p['nodes']:
@@ -384,7 +387,11 @@ def pki(p, work):
             run(['openssl', 'x509', '-req', '-in', str(d / 'node.csr'), '-CA', str(ca / 'ca.crt'), '-CAkey', str(ca / 'ca.key'),
                 '-set_serial', str(secrets.randbits(128)), '-days', '365', '-extfile', str(d / 'extensions'), '-out', str(d / 'node.crt')])
         run(['openssl', 'x509', '-in', str(d / 'node.crt'), '-checkend', '604800', '-noout'])
-        run(['openssl', 'verify', '-CAfile', str(ca / 'ca.crt'), str(d / 'node.crt')])
+        # Match the strict verification used by newer Python gateway runtimes.
+        # Existing malformed CAs can be repaired with repair-litellm-ca.sh.
+        for purpose in ('sslserver', 'sslclient'):
+            run(['openssl', 'verify', '-x509_strict', '-purpose', purpose,
+                '-CAfile', str(ca / 'ca.crt'), str(d / 'node.crt')])
         trust = (ca / 'ca.crt').read_bytes()
         if p['tls'].get('external_ca'):
             trust += b'\n' + Path(p['tls']['external_ca']).read_bytes()

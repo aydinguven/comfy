@@ -22,6 +22,12 @@ archive tests; actual RHEL deployment and failover validation remain required.
 For individual gateways, see [GUIDE.md](GUIDE.md) and [RUNBOOK.md](RUNBOOK.md).
 Run source tests with `python3 -m unittest -v test_cluster`.
 
+If gateway checks fail with **CA cert does not include key usage extension**,
+run [repair-litellm-ca.sh](repair-litellm-ca.sh) on the controller, then resume
+the same saved plan. See [RUNBOOK.md](RUNBOOK.md) for the backup and validation
+steps. New source installations generate explicit CA extensions and validate
+node certificates with strict TLS verification.
+
 For an intentional fresh start on one host, see
 [reset-litellm.sh](reset-litellm.sh) and the reset instructions in
 [RUNBOOK.md](RUNBOOK.md). Start with `sudo bash reset-litellm.sh --dry-run`.
