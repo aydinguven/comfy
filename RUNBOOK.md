@@ -8,6 +8,24 @@ litellm-haproxy; they have no automatic failover. Resume with the same plan and
 bundle. Switching an existing deployment between one and three nodes is a
 migration, not a bootstrap retry.
 
+For a deliberate fresh start on one host, use [reset-litellm.sh](reset-litellm.sh):
+
+    sudo bash reset-litellm.sh --dry-run
+    sudo bash reset-litellm.sh
+
+It asks for the hostname, stops/disables PostgreSQL and LiteLLM's system services,
+and archives existing data/configuration under a root-only
+`/var/lib/litellm-reset.XXXXXXXX` directory. All PostgreSQL databases under
+`/var/lib/pgsql/data` are taken offline, including any unrelated databases there.
+It refuses mounted data directories, running PostgreSQL processes and remaining
+installation-port listeners before moving data. A refusal after service stops
+leaves those services stopped; resolve the reported issue before proceeding.
+It keeps packages, SSH keys, firewall rules and cached Podman images. Stop any
+rootless/unrelated service reported by the listener check separately after
+identifying it. The helper affects only its current host and never contacts
+other nodes or external services. Keep the backup until the replacement works;
+partially failed moves must be inspected before retrying.
+
 For installer 2026-10-22.6, rerun `sudo python3.12 install.py cluster` on node 1
 and choose Resume. Sudo-password prompts are selected in the wizard; an
 `ANSIBLE_BECOME_ASK_PASS` environment variable is no longer required. An
